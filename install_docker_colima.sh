@@ -56,8 +56,6 @@ install_macos() {
         info "Homebrew already installed"
     fi
 
-    BREW_PREFIX="$(brew --prefix)"
-
     # --- Docker CLI + Compose ---
     if ! command -v docker &>/dev/null; then
         info "Installing docker and docker-compose via brew..."
@@ -95,7 +93,44 @@ install_macos() {
             --vm-type "$COLIMA_VMTYPE"
     fi
 
-    # --- LaunchAgent for auto-start on reboot ---
+    # --- Self-healing keep-alive watchdog + LaunchAgent ---
+    # The LaunchAgent runs under launchd's minimal PATH (/usr/bin:/bin:...), which
+    # does NOT include Homebrew's bin dir. `colima` shells out to `limactl`; without
+    # a full PATH that lookup fails and the VM never starts. The wrapper sets a
+    # complete PATH and re-checks status, so a login start, a periodic tick, or a
+    # sleep/wake cycle all converge on "Colima is running."
+    COLIMA_BIN_DIR="$(dirname "$COLIMA_BIN")"
+    WRAPPER_DIR="$HOME/.local/bin"
+    WRAPPER_FILE="$WRAPPER_DIR/colima-keepalive.sh"
+    RUNTIME_PATH="${COLIMA_BIN_DIR}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    mkdir -p "$WRAPPER_DIR"
+
+    info "Creating Colima keep-alive watchdog at ${WRAPPER_FILE}..."
+    cat > "$WRAPPER_FILE" <<WRAPPER
+#!/usr/bin/env bash
+# colima-keepalive.sh — ensures Colima is running.
+# Invoked by the com.colima.start LaunchAgent at login and on a periodic timer so
+# the VM self-heals after sleep/wake, crashes, or a manual stop. Managed by
+# install_docker_colima.sh; edits here are overwritten on re-install.
+export PATH="${RUNTIME_PATH}"
+
+# Already up — nothing to do.
+colima status >/dev/null 2>&1 && exit 0
+
+# A sleep/wake cycle can leave the VM in a Broken state that blocks a clean start.
+if colima list 2>/dev/null | grep -Eq 'Broken'; then
+    colima delete -f >/dev/null 2>&1 || true
+fi
+
+exec colima start \\
+    --cpu "${COLIMA_CPU}" \\
+    --memory "${COLIMA_MEMORY}" \\
+    --disk "${COLIMA_DISK}" \\
+    --vm-type "${COLIMA_VMTYPE}"
+WRAPPER
+    chmod +x "$WRAPPER_FILE"
+
     PLIST_DIR="$HOME/Library/LaunchAgents"
     PLIST_FILE="$PLIST_DIR/com.colima.start.plist"
 
@@ -104,20 +139,26 @@ install_macos() {
     info "Creating LaunchAgent at ${PLIST_FILE}..."
     cat > "$PLIST_FILE" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://plist.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.colima.start</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${COLIMA_BIN}</string>
-        <string>start</string>
+        <string>${WRAPPER_FILE}</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${RUNTIME_PATH}</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
-    <key>KeepAlive</key>
-    <false/>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
     <key>StandardOutPath</key>
     <string>/tmp/colima-launchagent.stdout.log</string>
     <key>StandardErrorPath</key>
@@ -126,10 +167,16 @@ install_macos() {
 </plist>
 PLIST
 
-    # Unload first if already loaded, then load
-    launchctl unload "$PLIST_FILE" 2>/dev/null || true
-    launchctl load "$PLIST_FILE"
-    info "LaunchAgent loaded — Colima will auto-start on reboot"
+    # Reload with modern launchctl (bootstrap/bootout), falling back to load/unload
+    # on older macOS. kickstart triggers an immediate run so it's active right now.
+    DOMAIN="gui/$(id -u)"
+    launchctl bootout "$DOMAIN/com.colima.start" 2>/dev/null || \
+        launchctl unload "$PLIST_FILE" 2>/dev/null || true
+    launchctl bootstrap "$DOMAIN" "$PLIST_FILE" 2>/dev/null || \
+        launchctl load "$PLIST_FILE"
+    launchctl enable "$DOMAIN/com.colima.start" 2>/dev/null || true
+    launchctl kickstart "$DOMAIN/com.colima.start" 2>/dev/null || true
+    info "LaunchAgent loaded — Colima auto-starts at login and self-heals every 60s"
 
     # --- Docker Compose CLI plugin (if not already wired) ---
     DOCKER_CLI_PLUGINS="$HOME/.docker/cli-plugins"
@@ -176,6 +223,7 @@ install_ubuntu() {
 
     # --- Docker apt repo ---
     ARCH="$(dpkg --print-architecture)"
+    # shellcheck source=/dev/null
     CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
 
     info "Adding Docker apt repository..."
