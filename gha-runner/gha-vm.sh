@@ -65,6 +65,13 @@ apply_defaults() {
 	CLOUDIMG_BASE="${CLOUDIMG_BASE:-https://cloud-images.ubuntu.com/releases/${UBUNTU_RELEASE}/release}"
 	CLOUDIMG_NAME="${CLOUDIMG_NAME:-ubuntu-${UBUNTU_RELEASE}-server-cloudimg-amd64.img}"
 
+	# Resolvers used only while virt-customize builds the image; the guest's own
+	# resolv.conf is restored before the golden is sealed. 169.254.2.3 is the DNS
+	# forwarder built into the qemu slirp NAT that libguestfs puts the appliance
+	# behind (net=169.254.2.15/16, gateway .2). The public resolvers follow it as
+	# a fallback in case that layout changes.
+	GUEST_DNS="${GUEST_DNS:-169.254.2.3 1.1.1.1 8.8.8.8}"
+
 	STATE_DIR="${STATE_DIR:-/var/lib/gha-vm}"
 	GOLDEN="${GOLDEN:-$STATE_DIR/golden.qcow2}"
 	RUN_DIR="${RUN_DIR:-$STATE_DIR/run}"
@@ -344,6 +351,12 @@ DEPS_PACKAGES=(
 	cloud-image-utils guestfs-tools
 	nftables curl jq openssl ca-certificates gpgv util-linux
 	ubuntu-cloudimage-keyring
+	# The libguestfs appliance runs dhclient to bring its NIC up, and supermin
+	# only copies in binaries from packages listed in its own supermin.d/packages
+	# -- which names isc-dhcp-client, no longer part of a default Ubuntu install.
+	# Without it the build appliance has loopback only, and every apt fetch inside
+	# virt-customize fails as "Temporary failure resolving".
+	isc-dhcp-client
 )
 
 apt_available() {
@@ -513,10 +526,22 @@ cmd_deps() {
 
 	setup_kvm
 
+	local had_dhclient=0
+	if command -v dhclient >/dev/null 2>&1; then had_dhclient=1; fi
+
 	export DEBIAN_FRONTEND=noninteractive
 	apt_get update
 	ensure_apt_components "${DEPS_PACKAGES[@]}"
 	apt_get install -y --no-install-recommends "${DEPS_PACKAGES[@]}"
+
+	# supermin bakes the host's installed packages into a cached appliance under
+	# /var/tmp. An appliance built before dhclient existed has no way to bring its
+	# NIC up, and every apt fetch inside virt-customize then fails as "Temporary
+	# failure resolving" -- so discard it and let the next image build rebuild.
+	if ((had_dhclient == 0)) && command -v dhclient >/dev/null 2>&1; then
+		log "discarding the cached libguestfs appliance so it picks up dhclient"
+		rm -rf /var/tmp/.guestfs-*
+	fi
 
 	setup_timesync
 	systemctl enable nftables.service >/dev/null 2>&1 ||
@@ -679,6 +704,52 @@ guest_root_free_mb() {
 		         END { if (free != "") print free }'
 }
 
+# The cloud image has no working /etc/resolv.conf offline: systemd-resolved owns
+# it and creates it at boot, so inside the libguestfs chroot it is either absent
+# or a symlink into /run that nothing populates. Apt then resolves nothing, treats
+# that as a warning, and falls back to the image's stale main-only indexes --
+# so the build dies much later on a universe package with no candidate. Point at
+# real resolvers and promote apt's fetch warnings to errors, so a broken resolver
+# fails here with the resolver error as the message.
+#
+# Whatever was there is kept aside for restore_guest_dns; -e is false for a
+# dangling symlink, hence the -L companion test.
+fix_guest_dns() {
+	local img="$1"
+	virt-customize -a "$img" \
+		--run-command "if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then \
+            mv /etc/resolv.conf /etc/resolv.conf.gha-orig; fi \
+        && for ns in $GUEST_DNS; do echo \"nameserver \$ns\" >>/etc/resolv.conf; done" \
+		--run-command 'apt-get -q update -o APT::Update::Error-Mode=any' \
+		>/dev/null && return 0
+
+	# apt only ever says "Temporary failure resolving", which covers both no route
+	# out of the appliance and a resolver that never answers. Print enough to tell
+	# those apart instead of leaving the next person to guess.
+	log "guest name resolution failed; appliance network state follows"
+	virt-customize -a "$img" --run-command \
+		'echo "--- addresses"; ip -o addr show
+echo "--- routes"; ip route show
+echo "--- resolv.conf"; cat /etc/resolv.conf' >&2 ||
+		log "could not collect the appliance network state"
+	die "guest name resolution failed during image build (GUEST_DNS='$GUEST_DNS')"
+}
+
+# Own virt-customize run rather than a trailing --run-command in the build: this
+# has to land strictly after every network-using operation, and only ordering
+# between whole invocations is guaranteed. Leaving the build resolvers in place
+# would hardcode them into every runner VM. When the image shipped no
+# /etc/resolv.conf at all, the correct restore is to leave none: systemd-resolved
+# writes it at boot.
+restore_guest_dns() {
+	virt-customize -a "$1" \
+		--run-command 'rm -f /etc/resolv.conf
+if [ -e /etc/resolv.conf.gha-orig ] || [ -L /etc/resolv.conf.gha-orig ]; then
+    mv /etc/resolv.conf.gha-orig /etc/resolv.conf
+fi' \
+		>/dev/null || die "could not restore the guest's original /etc/resolv.conf"
+}
+
 cmd_image() {
 	[[ $EUID -eq 0 ]] || die "image must run as root"
 	need qemu-img
@@ -689,6 +760,13 @@ cmd_image() {
 	need gpgv
 	[[ -r /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg ]] ||
 		die "missing /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg (apt install ubuntu-cloudimage-keyring)"
+	# supermin builds the build appliance out of packages installed on THIS host,
+	# so a missing dhclient here leaves the appliance with loopback only. Caught up
+	# front because the symptom is an unrelated-looking apt resolver error.
+	command -v dhclient >/dev/null 2>&1 ||
+		die "missing dhclient, which the libguestfs build appliance needs to get an
+address (apt install isc-dhcp-client, or re-run: $SELF deps).
+Then discard the cached appliance: rm -rf /var/tmp/.guestfs-*"
 
 	local work base rsha tmp
 	work="$STATE_DIR/build"
@@ -730,6 +808,7 @@ or set ALLOW_UNVERIFIED_RUNNER=1 to install it unverified."
 	export LIBGUESTFS_BACKEND=direct
 
 	grow_guest_root "$tmp"
+	fix_guest_dns "$tmp"
 
 	virt-customize -a "$tmp" \
 		--update \
@@ -752,6 +831,8 @@ or set ALLOW_UNVERIFIED_RUNNER=1 to install it unverified."
 		--run-command 'apt-get clean && rm -rf /var/lib/apt/lists/* /var/log/journal/*' \
 		--truncate /etc/machine-id \
 		--delete /var/lib/dbus/machine-id
+
+	restore_guest_dns "$tmp"
 
 	# Overlay reads are served from the host page cache shared by every slot, so a
 	# smaller golden directly cuts per-slot memory pressure.
@@ -944,8 +1025,8 @@ cmd_run() {
 	shutdown() {
 		stopping=1
 		log "slot $slot: stopping"
-		[[ -n "$vmpid" ]] && kill -TERM "$vmpid" 2>/dev/null || true
-		[[ -n "$tailpid" ]] && kill -TERM "$tailpid" 2>/dev/null || true
+		if [[ -n "$vmpid" ]]; then kill -TERM "$vmpid" 2>/dev/null || true; fi
+		if [[ -n "$tailpid" ]]; then kill -TERM "$tailpid" 2>/dev/null || true; fi
 		[[ -n "${name:-}" ]] && { reap_one "$name" || true; }
 		[[ -n "${dir:-}" ]] && rm -rf "$dir"
 		exit 0
