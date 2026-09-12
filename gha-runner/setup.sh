@@ -64,6 +64,54 @@ ask_secret() { # ask_secret VAR "prompt" [keep-if-empty]
 	printf -v "$__var" '%s' "$ans"
 }
 
+# Takes the key either way, deciding on the first line so there is only one
+# prompt: a pasted PEM block (collected up to its END line, so no Ctrl-D) or a
+# path to the downloaded .pem. Returns the key in VAR; the caller writes it out.
+# Never echoes it back, and never puts it on a command line where /proc would
+# expose it to every user on the box.
+ask_key() { # ask_key VAR
+	local __var="$1" line body="" lines=0 src
+	info 'Private key (step 8): paste the whole PEM block, or give a path to the .pem'
+	printf '    '
+	IFS= read -r line || die "input ended; nothing was installed"
+	line="${line%$'\r'}"
+
+	if [[ "$line" == *"-----BEGIN "*"PRIVATE KEY-----"* ]]; then
+		body="$line"
+		while [[ "$line" != *"-----END "*"PRIVATE KEY-----"* ]]; do
+			IFS= read -r line ||
+				die "input ended before the key's END line; nothing was installed"
+			line="${line%$'\r'}"
+			# A paste that never terminates would otherwise read forever. A 4096-bit
+			# key is about 51 lines.
+			if ((++lines > 200)); then
+				warn "no END line after 200 lines; that does not look like a PEM key"
+				return 1
+			fi
+			body+=$'\n'"$line"
+		done
+	else
+		src="${line/#\~/$HOME}"
+		[[ -n "$src" ]] || {
+			warn "nothing entered"
+			return 1
+		}
+		[[ -r "$src" ]] || {
+			warn "cannot read: $src"
+			hint "paste the key contents instead, or scp the .pem here first"
+			return 1
+		}
+		body="$(cat "$src")"
+	fi
+
+	printf '%s\n' "$body" | openssl pkey -noout 2>/dev/null || {
+		warn "that is not a usable private key (openssl could not read it)"
+		hint "GitHub's file starts with: -----BEGIN RSA PRIVATE KEY-----"
+		return 1
+	}
+	printf -v "$__var" '%s' "$body"
+}
+
 ask_yn() { # ask_yn "prompt" [y|n]
 	local prompt="$1" def="${2:-y}" ans h
 	[[ "$def" == y ]] && h="Y/n" || h="y/N"
@@ -189,14 +237,15 @@ step "2/6  GitHub connection"
 
 [[ -f "$CONFIG" ]] || die "$CONFIG missing; run host setup (step 1) first"
 
-# ask/ask_choice/ask_secret assign through `printf -v`, which static analysis
-# cannot follow; declaring the targets here keeps that visible.
+# ask/ask_choice/ask_secret/ask_key assign through `printf -v`, which static
+# analysis cannot follow; declaring the targets here keeps that visible.
 scope=""
 org=""
 repo=""
 mode=""
 appid=""
-src=""
+keypem=""
+keep_key=0
 pat=""
 cpus=""
 mem=""
@@ -266,7 +315,8 @@ if [[ "$mode" == app ]]; then
 	printf '\n'
 	info "Then, on the app's page:"
 	info "  7. Note the App ID at the top (a number, not the Client ID)."
-	info "  8. Generate a private key -> a .pem downloads. You need its path below."
+	info "  8. Generate a private key -> a .pem downloads. Open it and copy the"
+	info "     whole block; you paste it below (a file path also works)."
 	info "  9. Install App (left sidebar) -> install it on $app_where."
 	printf '\n'
 	hint "  existing apps: $app_list"
@@ -278,33 +328,43 @@ if [[ "$mode" == app ]]; then
 		warn "the App ID is numeric -- not the Client ID (Iv1...), not the name"
 	done
 
+	# A readable PEM on disk is not evidence that it belongs to THIS app. Rotating
+	# to a new app leaves the old key in place, still valid-looking and completely
+	# useless -- every token mint then 404s with the app installed and nothing
+	# obviously wrong. A changed App ID proves the mismatch, so replace by default
+	# there; otherwise keep by default, so pressing enter through changes nothing.
+	keep_key=0
 	if [[ -r "$cur_key" ]] && grep -q 'PRIVATE KEY' "$cur_key" 2>/dev/null; then
-		good "private key already installed at $cur_key"
+		if [[ -n "$cur_appid" && "$appid" != "$cur_appid" ]]; then
+			warn "the App ID changed ($cur_appid -> $appid), so the key at $cur_key"
+			warn "belongs to the old app and cannot authenticate as the new one."
+			ask_yn "Replace the private key?" y || keep_key=1
+		else
+			good "private key already installed at $cur_key"
+			ask_yn "Keep it?" y && keep_key=1
+		fi
+	fi
+
+	if ((keep_key)); then
 		keypath="$cur_key"
 	else
-		while :; do
-			ask src "Path to the .pem private key (step 8)" ""
-			[[ -r "$src" ]] || {
-				warn "cannot read: $src"
-				hint "if it is on your laptop: scp it here first, then give that path"
-				continue
-			}
-			grep -q 'PRIVATE KEY' "$src" || {
-				warn "that file is not a PEM private key"
-				continue
-			}
-			break
-		done
 		keypath="$CONFIG_DIR/app.pem"
 		gha_group="$(cfg_get GHA_USER)"
 		gha_group="${gha_group:-gha}"
 		getent group "$gha_group" >/dev/null ||
 			die "group '$gha_group' does not exist; run host setup (step 1) first"
-		if [[ "$(readlink -f "$src")" != "$(readlink -f "$keypath" 2>/dev/null)" ]]; then
-			# The supervisor runs as this user and has to read the key.
-			install -o root -g "$gha_group" -m 0640 "$src" "$keypath" ||
-				die "could not install the key to $keypath"
-		fi
+
+		keypem=""
+		until ask_key keypem; do :; done
+
+		# Create it empty at its final owner and mode first: writing then chmod'ing
+		# would leave the key world-readable for the moment in between. The
+		# supervisor runs as this group and has to read it.
+		install -o root -g "$gha_group" -m 0640 /dev/null "$keypath" ||
+			die "could not create $keypath"
+		printf '%s\n' "$keypem" >"$keypath" ||
+			die "could not write the key to $keypath"
+		unset keypem
 		good "key installed at $keypath (root:$gha_group, 0640)"
 	fi
 	cfg_set AUTH_MODE app

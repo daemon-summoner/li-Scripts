@@ -41,9 +41,10 @@ takes about two minutes.
 6. **Create GitHub App.**
 7. Note the **App ID** at the top of the app's page. It is a number — not the
    Client ID (`Iv1...`), not the app name.
-8. **Generate a private key** → a `.pem` downloads. `setup.sh` asks for its path
-   and installs it to `/etc/gha-vm/app.pem` as `root:gha` mode `0640`. If it
-   landed on your laptop, `scp` it to the server first.
+8. **Generate a private key** → a `.pem` downloads. Open it and paste the whole
+   block into `setup.sh` when it asks; a path to the file works there too. Either
+   way it lands at `/etc/gha-vm/app.pem` as `root:gha` mode `0640`. Pasting saves
+   an `scp` when the key downloaded to your laptop.
 9. **Install App** in the left sidebar → install it on the org (or repo).
 
 Changing a permission later re-issues an installation request that an org owner
