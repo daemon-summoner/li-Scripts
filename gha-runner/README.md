@@ -225,7 +225,9 @@ It edits only the `runs-on` line, leaving comments and formatting byte-identical
 and refuses anything it cannot rewrite unambiguously — `${{ matrix.os }}`, the
 `group:`/`labels:` mapping, a list mixing hosted and custom labels, or a block
 list carrying comments. Those are listed as `MANUAL`. Exit status is 1 when any
-job has a blocker, so it works as a CI check. Needs `python3-ruamel.yaml`.
+job has a blocker, so it works as a CI check. Needs `ruamel.yaml`
+(`apt install python3-ruamel.yaml` on Debian/Ubuntu, `pip install ruamel.yaml`
+elsewhere; the script prints the exact command for its interpreter when missing).
 
 The blockers it knows about, all of them things GitHub-hosted provides and this
 image does not:

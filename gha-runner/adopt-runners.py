@@ -8,9 +8,23 @@ golden image; --apply rewrites the movable `runs-on` lines in place.
 
 import argparse
 import re
+import shutil
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
+
+
+def _ruamel_install_hint() -> str:
+    """Install command for the interpreter that is actually running this script."""
+    if shutil.which("apt"):
+        return "sudo apt install python3-ruamel.yaml"
+    cmd = f"{sys.executable} -m pip install ruamel.yaml"
+    # PEP 668: Homebrew and Debian pythons refuse pip installs without this flag.
+    if (Path(sysconfig.get_path("stdlib")) / "EXTERNALLY-MANAGED").exists():
+        cmd += " --break-system-packages"
+    return cmd
+
 
 try:
     from ruamel.yaml import YAML
@@ -18,7 +32,7 @@ try:
 except ImportError:
     sys.exit(
         "adopt-runners.py needs ruamel.yaml to locate `runs-on` accurately.\n"
-        "  sudo apt install python3-ruamel.yaml\n"
+        f"  {_ruamel_install_hint()}\n"
         "Regex would be enough for most files and would silently mangle the rest,"
         " which is not a trade worth making across every repo you own."
     )
