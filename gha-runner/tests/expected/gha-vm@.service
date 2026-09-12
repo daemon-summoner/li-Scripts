@@ -1,0 +1,63 @@
+[Unit]
+Description=Ephemeral GitHub Actions runner VM (slot %i)
+After=network-online.target nftables.service time-sync.target
+Wants=network-online.target nftables.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=gha
+Group=gha
+SupplementaryGroups=kvm
+Environment=GHA_CONFIG=/etc/gha-vm/config.env
+EnvironmentFile=-/etc/gha-vm/env
+ExecStartPre=+/usr/local/lib/gha-vm/gha-vm.sh netcheck
+ExecStart=/usr/local/lib/gha-vm/gha-vm.sh run %i
+Restart=always
+RestartSec=5
+RestartSteps=8
+RestartMaxDelaySec=300
+# netcheck resolves every endpoint with a bounded resolver; this covers the
+# worst case of all of them timing out.
+TimeoutStartSec=300
+# The supervisor lets a running job finish for STOP_GRACE_SEC before killing
+# the VM; the unit gives it that plus a margin for cleanup.
+TimeoutStopSec=1020
+KillSignal=SIGTERM
+KillMode=mixed
+SyslogIdentifier=gha-vm
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=20000
+UMask=0077
+
+# One runaway slot must not take the host down with it.
+MemoryMax=10240M
+CPUWeight=50
+IOWeight=50
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/gha-vm
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=false
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+
+[Install]
+WantedBy=multi-user.target
