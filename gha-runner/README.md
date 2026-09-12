@@ -200,6 +200,52 @@ the config and rebuilds the golden image. Leave it on: GitHub refuses runners
 more than 30 days behind. Running slots adopt a new image when their current VM
 finishes, so a rebuild never interrupts a job.
 
+## Moving workflows onto the fleet
+
+Nothing routes here automatically. `runs-on:` is the only selector, and a
+GitHub-hosted label never falls through to a self-hosted runner. The runners
+register with these labels:
+
+```
+self-hosted, linux, x64, vm, ephemeral, docker, <short hostname>
+```
+
+`adopt-runners.py` sweeps a directory of repos and reports every job that could
+move, plus every step that would break on the golden image. It writes nothing
+without `--apply`, and `--apply` skips any repo with uncommitted changes — git
+is the undo.
+
+```bash
+./adopt-runners.py ~/Projects                       # audit only
+./adopt-runners.py ~/Projects --apply               # rewrite runs-on
+./adopt-runners.py ~/Projects --apply --label self-hosted,develop
+```
+
+It edits only the `runs-on` line, leaving comments and formatting byte-identical,
+and refuses anything it cannot rewrite unambiguously — `${{ matrix.os }}`, the
+`group:`/`labels:` mapping, a list mixing hosted and custom labels, or a block
+list carrying comments. Those are listed as `MANUAL`. Exit status is 1 when any
+job has a blocker, so it works as a CI check. Needs `python3-ruamel.yaml`.
+
+The blockers it knows about, all of them things GitHub-hosted provides and this
+image does not:
+
+| Blocker | Why |
+|---|---|
+| `sudo` | the guest `runner` user is created with `-G docker` only |
+| node / pip / go / java / dotnet / rust | not installed; add the matching `actions/setup-*` |
+| `gh`, `aws`, `az`, `gcloud`, `kubectl`, `helm`, `terraform` | not installed |
+| nested virt | Android emulator, `vagrant`, `qemu-system-x86_64` — `NESTED_VIRT=0` |
+
+A job already calling the right `actions/setup-*` is not flagged for it, and a
+`container:` job is only checked for nested virt, since its steps run inside its
+own image.
+
+One org variable makes the whole fleet switchable without touching workflows
+again — set `CI_RUNNER` under *Org → Settings → Secrets and variables → Actions*
+and use `runs-on: ${{ vars.CI_RUNNER }}`. Flipping it back to `ubuntu-latest`
+moves everything to GitHub's runners while the box is down for a rebuild.
+
 ## Isolation details
 
 `gha-vm.sh net` installs an nftables `output` chain matching on the `gha` uid:
@@ -249,6 +295,7 @@ most of the duplication is anyway.
 | `setup.sh` | guided installer; the normal way in |
 | `gha-vm.sh` | host supervisor, image builder, installer |
 | `gha-job.sh` | runs inside the guest; takes one job, powers off |
+| `adopt-runners.py` | audits a tree of repos for workflows that can move here |
 | `config.vm.env.example` | annotated config, installed to `/etc/gha-vm/config.env` |
 | `profiles/*.env` | per-host sizing, installed to `/etc/gha-vm/profiles/` |
 | `/var/lib/gha-vm/golden.qcow2` | golden image, backing file for every overlay |
