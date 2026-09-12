@@ -72,6 +72,10 @@ die() {
 }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing command: $1 (try: $SELF deps)"; }
 
+# /proc, KVM, nftables and systemd are assumed throughout; anything else
+# fails in confusing places (the first is awk on /proc/meminfo).
+[[ "$(uname -s)" == Linux ]] || die "gha-vm runs only on a Linux (Ubuntu) host with KVM; this is $(uname -s)"
+
 # ---------------------------------------------------------------- config ----
 
 apply_defaults() {
