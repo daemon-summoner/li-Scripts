@@ -195,6 +195,10 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
+# Everything below leans on /proc, KVM, apt, nftables and systemd. Refuse
+# before the sudo re-exec so a laptop never gets as far as a password prompt.
+[[ "$(uname -s)" == Linux ]] || die "gha-vm runs only on a Linux (Ubuntu) host with KVM; this is $(uname -s). Run setup.sh on the server, not on your workstation."
+
 if [[ $EUID -ne 0 ]]; then
 	command -v sudo >/dev/null 2>&1 || die "run this as root"
 	# `sudo env VAR=...` rather than `sudo -E`: env_reset drops the override on
