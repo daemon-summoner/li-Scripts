@@ -268,7 +268,7 @@ auth_token() {
 	: "${GITHUB_APP_ID:?}" "${GITHUB_APP_KEY:?}"
 	[[ -r "$GITHUB_APP_KEY" ]] || die "cannot read app key: $GITHUB_APP_KEY"
 
-	local jwt inst_url inst_id perms resp
+	local jwt inst_url inst_id perms resp code target
 	jwt="$(_app_jwt)"
 	# The two JIT-runner endpoints want different permissions, and asking for one
 	# the installation does not hold is a 422 rather than a smaller token.
@@ -277,15 +277,41 @@ auth_token() {
 	if [[ "$SCOPE" == org ]]; then
 		inst_url="$API/orgs/$GITHUB_ORG/installation"
 		perms='{"permissions":{"organization_self_hosted_runners":"write"}}'
+		target="organization '$GITHUB_ORG'"
 	else
 		inst_url="$API/repos/$GITHUB_REPO/installation"
 		perms='{"permissions":{"administration":"write"}}'
+		target="repository '$GITHUB_REPO'"
 	fi
 
-	inst_id=$(curl -fsS --max-time 30 --retry 3 --retry-delay 2 --retry-connrefused \
+	# -f would collapse "app is not installed" (404), "GitHub rejected the key or
+	# the app id" (401) and a GitHub outage (5xx) into one exit code, and each one
+	# needs a different fix. Keep the status and say which happened.
+	resp=$(curl -sS --max-time 30 --retry 3 --retry-delay 2 --retry-connrefused \
+		-w '\n%{http_code}' \
 		-H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \
-		-H "X-GitHub-Api-Version: $APIV" "$inst_url" | jq -r '.id')
-	[[ -n "$inst_id" && "$inst_id" != null ]] || die "app not installed on that org/repo"
+		-H "X-GitHub-Api-Version: $APIV" "$inst_url") ||
+		die "could not reach $inst_url"
+	code="${resp##*$'\n'}"
+	resp="${resp%$'\n'*}"
+	case "$code" in
+	200) ;;
+	401) die "GitHub rejected the app credentials for app id '$GITHUB_APP_ID'
+(HTTP 401: $(jq -r '.message // empty' <<<"$resp")).
+The key in $GITHUB_APP_KEY no longer matches the app, or GITHUB_APP_ID is wrong.
+Generate a fresh private key on the app's settings page and replace that file." ;;
+	404) die "GitHub App id '$GITHUB_APP_ID' is not installed on $target (HTTP 404).
+The app authenticated, so its id and key are fine -- the installation is gone.
+Either it was uninstalled, or $target was renamed or deleted.
+Re-install it from the app's 'Install App' page, then confirm it is listed under
+that account's Installed GitHub Apps. Update GITHUB_ORG/GITHUB_REPO in $CONFIG
+if the name changed." ;;
+	*) die "unexpected HTTP $code from $inst_url: $(jq -r '.message // .' <<<"$resp")" ;;
+	esac
+
+	inst_id=$(jq -r '.id' <<<"$resp")
+	[[ -n "$inst_id" && "$inst_id" != null ]] ||
+		die "no installation id in GitHub's reply for $target: $resp"
 
 	resp=$(curl -fsS --max-time 30 -X POST -H "Authorization: Bearer $jwt" \
 		-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: $APIV" \
@@ -305,7 +331,12 @@ organization's Installed GitHub Apps entry."
 
 api() {
 	local method="$1" path="$2" body="${3:-}" tok
-	tok="$(auth_token)"
+	# auth_token dies inside a command substitution, so its status must be tested
+	# here: bash suppresses set -e for the whole call tree whenever a caller tests
+	# the result (`if ! jit="$(mint_jit ...)"`), and going on regardless would send
+	# an empty bearer token -- surfacing GitHub's 401 in place of the real reason.
+	tok="$(auth_token)" || return 1
+	[[ -n "$tok" ]] || die "auth_token returned an empty token"
 	if [[ -n "$body" ]]; then
 		# No --retry on writes: a lost response would double-register a runner.
 		curl -fsS --max-time 30 -X "$method" -H "Authorization: Bearer $tok" \
@@ -1339,6 +1370,26 @@ user_can_read() {
 		-- test -r "$file" >/dev/null 2>&1
 }
 
+# GitHub's default only gates a contributor's FIRST run, so one merged typo fix
+# buys an account unreviewed use of this hardware forever. Printed under the
+# public-exposure DANGER because that is the case where it stops being a spend
+# control and becomes the only review gate in front of the runners.
+fork_approval_advice() {
+	local who
+	who="${GITHUB_ORG:-${GITHUB_REPO%%/*}}"
+	cat <<EOF
+  Make sure to switch this setting before enabling slots:
+    Org -> Settings -> Actions -> General
+    -> "Approval for running fork pull request workflows from contributors"
+    -> select "Require approval for all external contributors"
+  It covers every repo in the org and overrides the enterprise-level setting.
+  Or, with a token holding admin:org (the runner app does not):
+    gh api -X PUT /orgs/${who:-<YOUR-ORG>}/actions/permissions/fork-pr-contributor-approval \\
+      -f approval_policy=all_external_contributors
+  The default (first_time_contributors) only gates a contributor's first run.
+EOF
+}
+
 cmd_doctor() {
 	local ok=0 apt_holder
 	printf 'kvm: '
@@ -1390,8 +1441,12 @@ cmd_doctor() {
 	fi
 
 	printf 'kvm module: '
-	if kvm_module; then
-		echo "OK ($(kvm_module))"
+	# kvm_module prints the name, so calling it as the condition leaks that name
+	# onto the report line before the verdict is written.
+	local kvmmod=""
+	kvmmod="$(kvm_module)" || kvmmod=""
+	if [[ -n "$kvmmod" ]]; then
+		echo "OK ($kvmmod)"
 	elif grep -qm1 -E '^flags.*\b(vmx|svm)\b' /proc/cpuinfo; then
 		echo "not loaded (run: $SELF deps)"
 		ok=1
@@ -1436,8 +1491,15 @@ cmd_doctor() {
 	fi
 
 	printf 'auth: '
-	if auth_token >/dev/null 2>&1; then echo "OK ($AUTH_MODE)"; else
+	# Two things force the command substitution. auth_token dies on failure, and
+	# called bare in an `if` it is NOT in a subshell -- its exit would end the whole
+	# report, silently skipping every check below. And its message is the single
+	# most useful line here (which of 401/404/422, and what to do), so capture
+	# stderr and print it rather than discarding it with the token.
+	local autherr=""
+	if autherr="$(auth_token 2>&1 >/dev/null)"; then echo "OK ($AUTH_MODE)"; else
 		echo FAIL
+		[[ -n "$autherr" ]] && printf '  %s\n' "$autherr"
 		ok=1
 	fi
 	printf 'runner admin access: '
@@ -1460,11 +1522,13 @@ cmd_doctor() {
 	if [[ "$SCOPE" == repo ]]; then
 		if [[ "$(api GET "/repos/$GITHUB_REPO" | jq -r .private)" == false ]]; then
 			echo "DANGER: $GITHUB_REPO is public; fork PRs execute arbitrary code here"
+			fork_approval_advice
 			ok=1
 		else echo OK; fi
 	else
 		if [[ "$(api GET "/orgs/$GITHUB_ORG/repos?type=public&per_page=1" | jq 'length')" -gt 0 ]]; then
 			echo "DANGER: org has public repos; restrict the runner group to private repos"
+			fork_approval_advice
 			ok=1
 		else echo OK; fi
 	fi
