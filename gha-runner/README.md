@@ -15,6 +15,15 @@ through a cloud-init seed.
 - Ubuntu 26.04 LTS host with `/dev/kvm` (virtualization enabled in BIOS)
 - A GitHub App (preferred) or PAT — see below
 - NVMe for `STATE_DIR` — every job writes a fresh qcow2 overlay there
+- x86_64 is what runs in production. aarch64 hosts are parametrized end to end
+  (arm64 runner, arm64 cloud image, `qemu-system-aarch64` with AAVMF firmware)
+  but untested; expect to touch `QEMU_MACHINE` or the firmware paths.
+- GitHub Enterprise Server works by setting `GITHUB_SERVER_URL`; the API URL
+  follows as `<server>/api/v3`. Runner tarballs still download from github.com
+  unless `RUNNER_DOWNLOAD_BASE` points at a mirror (https only). A server on
+  the LAN is reachable through the isolation rules without further config
+  (see Isolation details); a separate blob store for artifacts and caches on
+  the LAN needs `NET_ALLOW_CIDRS`.
 
 ## Creating the GitHub App
 
@@ -100,8 +109,9 @@ the device node predates it), recreating the state directories, tightening
 ruleset. Anything needing a decision -- credentials, scope, a public repo -- it
 leaves for you.
 
-`install` copies both scripts to `/usr/local/lib/gha-vm/` and points the units
-there, so the units do not depend on this checkout. **Re-run `install` after
+`install` copies both scripts (plus the example config and `profiles/`) to
+`/usr/local/lib/gha-vm/` and points the units there, so the units and the
+weekly upgrade do not depend on this checkout. **Re-run `install` after
 changing either script, and `image` after changing `gha-job.sh`** — the guest
 side is baked into the golden image.
 
@@ -114,17 +124,70 @@ slot back if its supervisor ever dies. The KVM modules are pinned in
 `/etc/nftables.conf` with `nftables.service` enabled, and the weekly image
 rebuild timer is `Persistent=true`, so it catches up after downtime.
 
-Two things make an unclean shutdown safe rather than merely survivable:
+The slot unit orders itself after `network-online.target`, `nftables.service`
+and `time-sync.target`, and `deps` enables `systemd-time-wait-sync` so the last
+one means "clock is synced" rather than "timesyncd started". A GitHub App JWT
+carries a timestamp GitHub checks, and a slot that mints one before NTP has
+settled fails with an auth error that looks like a bad key; the supervisor also
+waits up to `CLOCK_SYNC_WAIT` on its own in case the target is not there.
 
+What happens when something is not ready at boot:
+
+- The isolation rules are self-healing. `netcheck` runs as root before each
+  slot (`ExecStartPre=+`); if the `inet gha` table is missing it loads
+  `/etc/gha-vm/nftables.conf` itself and logs that it did, then refreshes the
+  resolver, host-address and endpoint sets from the live system, so a DHCP
+  change or a new resolver never leaves stale accept rules. A set whose
+  discovery comes back empty (resolver down at boot) keeps its previous
+  elements rather than losing them. Only when the ruleset file is gone too
+  does the slot refuse to start (`REQUIRE_ISOLATION=0` overrides that,
+  deliberately).
+- A supervisor that fails to mint a JIT config five times in a row exits so
+  the unit restarts it; the restart re-runs `netcheck`, which is the repair
+  for the one host-side cause (sets stale since the last refresh because a
+  resolver or endpoint moved).
+- A missing golden image is waited for, not fatal: the supervisor logs once and
+  polls every 60 s, so a slot enabled before the first `image` run comes up on
+  its own when the image lands.
+- Restarts back off. `RestartSteps=8` / `RestartMaxDelaySec=300` (systemd 254+;
+  `doctor` says when the host is older) stretch the retry gap from 5 s to 5 min
+  so a persistent failure does not spin the journal. JIT registration failures
+  back off inside the loop the same way, up to `JIT_BACKOFF_MAX`.
 - Each slot deletes its own leftover overlay at startup. Without that, every
   hard reboot would strand one disk image per slot, forever.
-- Each unit runs `gha-vm.sh netcheck` as root before starting (`ExecStartPre=+`).
-  If the nftables rules are missing, the slot refuses to start instead of
-  running untrusted jobs with no isolation. Set `REQUIRE_ISOLATION=0` to
-  override, deliberately.
 
-Jobs in flight at shutdown are lost — the runner is ephemeral and GitHub reports
-the job as failed. Nothing is corrupted; the next VM is a fresh clone.
+Shutdown and reboot are graceful. A slot with a job in flight gets
+`STOP_GRACE_SEC` (15 min) for the job to finish before the VM is killed; the
+unit's `TimeoutStopSec` is that plus 120 s (VM kill, then the bounded deregistration call). On any exit the supervisor's trap
+kills its QEMU, deregisters the slot's runner from GitHub (`REAP_ON_STOP=1`)
+and removes the run directory. What the trap cannot catch (`kill -9`, power
+loss) the next start cleans up: leftover run directories are deleted and the
+slot's stale registrations reaped before the first VM boots. Either way no
+orphan process, offline runner, or stray disk survives. A job that outlives the
+grace period is reported failed by GitHub; nothing is corrupted.
+
+To take a slot out of rotation without killing anything:
+
+```bash
+sudo gha-vm drain 3            # finish the current job, then idle
+sudo gha-vm undrain 3
+sudo gha-vm restart all        # drain every slot, restart its unit, undrain
+```
+
+`restart` is what to run after editing `gha-vm.sh` and re-running `install`.
+The supervisor also notices when its own script file changes on disk and
+re-execs itself between jobs, so a plain `install` is picked up without a
+restart; `restart` only matters when the unit file itself changed.
+
+### Host updates
+
+`deps` installs `unattended-upgrades` and writes
+`/etc/apt/apt.conf.d/52gha-vm` enabling daily security updates
+(`HOST_UNATTENDED=1`). Reboots for kernel or libc updates are opt-in:
+`HOST_AUTO_REBOOT=1` sets `Automatic-Reboot` at `HOST_AUTO_REBOOT_TIME`
+(04:30), and because shutdown drains slots, a job that is running at that
+moment gets its `STOP_GRACE_SEC` before the machine goes down. `repair`
+re-applies the policy if the file drifts from the config.
 
 ## Sizing two machines
 
@@ -169,18 +232,24 @@ letting the extra latency look like a broken image.
 
 ### Host profiles
 
-`deps` installs `profiles/*.env` to `/etc/gha-vm/profiles/`; each host loads the
-one matching `HOST_PROFILE`, then `<machine-id>.env`, then `<hostname>.env`,
-then `default.env`. Profiles are sourced **after** `config.env`, so sizing set
-there wins — keep credentials and scope in `config.env`, sizing in a profile.
-`setup.sh` notices an active profile and writes your sizing answers into it
-rather than into `config.env`, where they would be silently overridden.
-Details and a template: `profiles/README.md`.
+`deps` installs `profiles/*.env` to `/etc/gha-vm/profiles/`; each host loads
+one of them: `<HOST_PROFILE>.env` when `HOST_PROFILE` is set, otherwise
+`<machine-id>.env` if it exists, otherwise `<hostname>.env`; `default.env`
+stands in when the chosen file is absent, and `local.env` is sourced last
+regardless. Profiles are sourced **after**
+`config.env`, so sizing set there wins — keep credentials and scope in
+`config.env`, sizing in a profile. `local.env` is this host's own override
+layer: `deps` never touches it, and `setup.sh` writes your sizing answers there
+so a later `deps` reinstalling the profiles does not undo them. Details and a
+template: `profiles/README.md`.
 
 Both machines can share one org-level runner pool. Runner names and the
 nftables rules are per-host, so the two never touch each other's registrations.
-The host's short hostname is added as a runner label automatically, so a
-workflow can pin a machine with `runs-on: [self-hosted, <hostname>]`.
+The host's short hostname is added as a runner label
+(`RUNNER_LABELS_APPEND_HOST=1`, also on a custom `RUNNER_LABELS`), so a
+workflow can pin a machine with `runs-on: [self-hosted, <hostname>]`. Runner
+groups can be named (`RUNNER_GROUP=ci-private`) instead of numbered; each
+supervisor looks the id up once, at its first registration.
 
 ## Operating
 
@@ -189,16 +258,73 @@ gha-vm status                  # slots, live VMs, registered runners
 journalctl -fu 'gha-vm@*'      # live guest consoles
 gha-vm capacity
 gha-vm profile                 # which machine am I, what sizing did it pick
+gha-vm config [KEY]            # effective config after profile, local.env, defaults
 sudo gha-vm repair             # fix the mechanically-fixable preflight items
 sudo gha-vm install 20         # resize the fleet (also disables surplus slots)
+sudo gha-vm drain 2            # finish the current job, then take no more
+sudo gha-vm restart all        # drain, restart units, undrain
 sudo gha-vm reap               # delete stale offline registrations
+sudo gha-vm clean              # remove leftover run dirs (skips live slots; --force)
 sudo gha-vm uninstall          # stop and remove units
 ```
+
+`config` prints the resolved value of every knob (the PAT is masked in the
+listing; `config GITHUB_PAT` prints it raw), which is the quickest way to see
+what a profile or `local.env` actually changed.
+
+### Upgrades
 
 A weekly timer runs `gha-vm upgrade`, which pins the latest runner release in
 the config and rebuilds the golden image. Leave it on: GitHub refuses runners
 more than 30 days behind. Running slots adopt a new image when their current VM
-finishes, so a rebuild never interrupts a job.
+finishes, so a rebuild never interrupts a job. With `UPGRADE_REBUILD=always`
+(default) the image is rebuilt even when the runner version did not move, so
+Ubuntu package updates inside the guest are never more than a week old.
+
+The rebuild cannot leave the fleet on a broken image:
+
+- The cloud image cache is re-verified against Ubuntu's signed `SHA256SUMS` on
+  every build and re-downloaded on mismatch; the runner tarball hash is taken
+  from the release notes and pinned as `RUNNER_SHA256`.
+- `IMAGE_SELFTEST=1` boots the new image once, with a self-test seed instead of
+  a JIT config, and waits for the guest to start its runner binary and print
+  `GHA-VM: selftest ok`. No marker within `BOOT_TIMEOUT` means the build fails
+  with the last console lines in the journal and the current golden image is
+  untouched.
+- The outgoing image is kept as `golden.qcow2.prev` (`GOLDEN_KEEP_PREVIOUS=1`).
+  `sudo gha-vm rollback` swaps it back; running it again swaps forward.
+
+```bash
+sudo gha-vm upgrade --check    # what the timer would do, no writes
+sudo gha-vm upgrade            # do it now
+sudo gha-vm rollback
+```
+
+`RUNNER_VERSION` is pinned in whichever file currently sets it, normally
+`config.env`; if a profile or `local.env` overrides it, `upgrade` pins there
+instead and says so. The previous file is kept as `.bak` beside it.
+
+### Verifying an upgrade
+
+After pulling a new `gha-vm.sh` onto a host, in this order:
+
+```bash
+sudo gha-vm doctor
+sudo gha-vm install                           # keeps the installed slot count
+systemd-analyze verify 'gha-vm@1.service' gha-vm-upgrade.service gha-vm-upgrade.timer
+systemctl show gha-vm@1 -p RestartSteps -p TimeoutStopSec -p After
+sudo nft -c -f /etc/nftables.conf && sudo nft list table inet gha   # sets populated
+sudo gha-vm restart all
+journalctl -u 'gha-vm@*' --since -5m           # every slot reaches "up after"
+sudo gha-vm upgrade --check
+```
+
+Then one deliberate failure of each kind, to see the recovery paths work on
+this host rather than in this README: `sudo nft delete table inet gha` followed
+by `systemctl restart gha-vm@1` should log that netcheck loaded the rules
+itself; `sudo reboot` should bring every slot back with the `inet gha` table
+present before the first job; `systemctl stop gha-vm@1` during a job should
+wait for the job rather than kill it.
 
 ## Moving workflows onto the fleet
 
@@ -210,6 +336,8 @@ register with these labels:
 self-hosted, linux, x64, vm, ephemeral, docker, <short hostname>
 ```
 
+(`arm64` in place of `x64` on an aarch64 host.)
+
 `adopt-runners.py` sweeps a directory of repos and reports every job that could
 move, plus every step that would break on the golden image. It writes nothing
 without `--apply`, and `--apply` skips any repo with uncommitted changes — git
@@ -217,14 +345,16 @@ is the undo.
 
 ```bash
 ./adopt-runners.py ~/Projects                       # audit only
-./adopt-runners.py ~/Projects --apply               # rewrite runs-on
+./adopt-runners.py ~/Projects --apply               # rewrite runs-on to [self-hosted, linux, x64]
 ./adopt-runners.py ~/Projects --apply --label self-hosted,develop
+./adopt-runners.py ~/Projects --arch arm64          # an aarch64 fleet
 ```
 
 It edits only the `runs-on` line, leaving comments and formatting byte-identical,
 and refuses anything it cannot rewrite unambiguously — `${{ matrix.os }}`, the
-`group:`/`labels:` mapping, a list mixing hosted and custom labels, or a block
-list carrying comments. Those are listed as `MANUAL`. Exit status is 1 when any
+`group:`/`labels:` mapping, a list mixing hosted and custom labels, a block
+list carrying comments, or a hosted image for the other CPU family
+(`ubuntu-24.04-arm` on an x64 fleet). Those are listed as `MANUAL`. Exit status is 1 when any
 job has a blocker, so it works as a CI check. Needs `ruamel.yaml`
 (`apt install python3-ruamel.yaml` on Debian/Ubuntu, `pip install ruamel.yaml`
 elsewhere; the script prints the exact command for its interpreter when missing).
@@ -257,10 +387,61 @@ moves everything to GitHub's runners while the box is down for a rebuild.
   service bound to host loopback is reachable from inside a job.
 - **RFC1918 and link-local are blocked** — your LAN, and the 169.254.169.254
   metadata range.
-- **DNS is punched through** to the nameservers in `resolv.conf`, port 53 only.
+- **The host's own public addresses are blocked** (`NET_BLOCK_HOST_ADDRS=1`),
+  so a service bound to the host's external IP is no more reachable than one on
+  loopback.
+- **CGNAT, multicast, benchmarking, reserved and broadcast ranges are blocked**
+  (`NET_BLOCK_EXTRA=1`) — the ranges a VPN or a container network on the host
+  tends to sit in.
+- **DNS is punched through** to the host's resolvers, port 53 only.
+- **The GitHub endpoints and proxies are punched through**, each on the one
+  TCP port its URL names (443 or 80 by scheme when it names none): whatever
+  `GITHUB_SERVER_URL`, `GITHUB_API_URL`, `RUNNER_DOWNLOAD_BASE`,
+  `HTTPS_PROXY`/`HTTP_PROXY` and `GUEST_HTTP_PROXY` resolve to. For github.com
+  that changes nothing; for a GitHub Enterprise Server or a proxy inside a
+  blocked range it is what lets the runner register at all, without opening
+  the rest of that server. A `GUEST_HTTP_PROXY` at the gateway address
+  `10.0.2.2` is the host's loopback, so that proxy port and only that port
+  opens on `127.0.0.1`. Pin the addresses with `NET_ENDPOINT_ADDRS`
+  (`ADDR[:PORT]`, `[V6]:PORT`) if resolution is not to be trusted.
+- The resolver, host-address and endpoint lists live in named sets that
+  `netcheck` refreshes from the live system at every slot start, so they
+  follow DHCP, resolver and DNS changes instead of freezing at the moment
+  `net` ran.
 
-This also blocks a LAN apt mirror or an internal registry. Add accept rules
-above the drops in `/etc/gha-vm/nftables.conf` if you need one.
+An exception for a LAN apt mirror or an internal registry is one line of
+config, not a hand edit to the ruleset (which `net` regenerates):
+
+```
+NET_ALLOW_CIDRS=10.20.0.5/32,fd00:20::5/128
+```
+
+Allowed CIDRs are accepted before any drop rule. Re-run `sudo gha-vm net` after
+changing them.
+
+Every QEMU runs under its seccomp sandbox (`-sandbox on` with obsolete
+syscalls, privilege elevation, process spawning and resource control denied;
+`QEMU_SANDBOX=0` to disable) with `-nodefaults`, so a VM escape into the QEMU
+process still lands in a process that cannot fork or raise privileges. GitHub
+tokens never appear on a command line: they go to curl on stdin, and every
+call is pinned to HTTPS with TLS 1.2 or later.
+
+### Guest customization
+
+- `GUEST_EXTRA_PACKAGES` adds apt packages to the image on top of the base set.
+- `IMAGE_HOOK_DIR` (`/etc/gha-vm/image.d/*.sh`) runs each executable script
+  inside the image build as root, after packages, with `GUEST_HTTP_PROXY`
+  exported, for anything apt cannot express: a toolchain tarball, a CA
+  certificate, a registry login.
+- `GUEST_PRE_JOB_HOOK` is a script baked in as `/usr/local/bin/gha-pre-job.sh`
+  and run as root on every boot before the runner starts. A non-zero exit
+  refuses the job. The self-test boot runs it too, so a broken hook fails the
+  image build rather than every job after it.
+- `GUEST_HTTP_PROXY` bakes a proxy into `/etc/environment`, apt and dockerd
+  inside the guest; `HTTPS_PROXY` / `NO_PROXY` on the host side cover the API
+  calls and the image build. `GUEST_RUNTIME_DNS` pins the guest's resolvers.
+
+Re-run `sudo gha-vm image` after changing any of these; they are baked in.
 
 `doctor` fails loudly when the repo or org is public: a fork PR on a public repo
 runs attacker-authored code on your hardware. Use a private repo, or restrict
@@ -282,13 +463,37 @@ most of the duplication is anyway.
   its last 20 console lines are logged, instead of holding a slot for 6 hours.
 - A VM is killed after `MAX_LIFETIME` (6 h, matching GitHub's own job limit).
 - `-no-reboot` means a guest that panics and reboots exits instead of looping.
-- Repeated short or never-ready cycles back off up to 60 s.
+- Repeated short or never-ready cycles back off up to 60 s; JIT registration
+  failures back off 30 s, 60 s, ... up to `JIT_BACKOFF_MAX` (10 min), with the
+  HTTP status and any `retry-after` in the journal.
 - A slot refuses to start a VM below `MIN_FREE_GB` free space rather than
   filling the disk.
-- `flock` per slot stops a hand-started supervisor racing the systemd one.
-- Each slot reaps only its *own* stale registrations. A host-wide reap here
-  would race a sibling slot whose runner is registered but still booting — it
-  reads as "offline", and deleting it invalidates that slot's live JIT config.
+- `flock` per slot stops a hand-started supervisor racing the systemd one, and
+  `clean` refuses to touch a directory whose slot lock is held.
+- Each slot reaps only its *own* stale registrations, immediately after a
+  failed boot and otherwise every `REAP_INTERVAL`. A host-wide reap here would
+  race a sibling slot whose runner is registered but still booting — it reads
+  as "offline", and deleting it invalidates that slot's live JIT config. An
+  API failure during a reap is logged and skipped, never read as "no runners".
+- `doctor` warns when the golden image is older than `GOLDEN_MAX_AGE_DAYS`,
+  when the API is unreachable (public-repo checks report UNKNOWN rather than
+  OK), and when systemd is too old for `RestartSteps`.
+
+## Tests
+
+```bash
+tests/run.sh             # lint, then render + verify in docker (ubuntu:24.04)
+tests/run.sh --update    # regenerate tests/expected after an intended change
+```
+
+The suite syntax-checks and shellchecks every script, then inside a throwaway
+container renders the systemd units and the nftables ruleset from
+`tests/config.test.env`, diffs them against `tests/expected/`, runs
+`systemd-analyze verify` and `nft -c` on the result, and exercises the atomic
+config editor (`config-set` / `config-unset`) that `setup.sh` and `upgrade`
+use. Without docker it runs the lint half and says so. Anything involving KVM
+— booting a VM, a reboot, the drain — can only be verified on a host; see
+"Verifying an upgrade".
 
 ## Files
 
@@ -300,5 +505,12 @@ most of the duplication is anyway.
 | `adopt-runners.py` | audits a tree of repos for workflows that can move here |
 | `config.vm.env.example` | annotated config, installed to `/etc/gha-vm/config.env` |
 | `profiles/*.env` | per-host sizing, installed to `/etc/gha-vm/profiles/` |
+| `tests/` | render/verify suite and its expected units and ruleset |
+| `/etc/gha-vm/profiles/local.env` | this host's overrides; never rewritten by `deps` |
+| `/etc/gha-vm/image.d/*.sh` | image build hooks (`IMAGE_HOOK_DIR`) |
+| `/etc/gha-vm/env` | optional `KEY=value` lines the units load as environment; wins over every config file, only for the slot and upgrade units |
+| `/etc/gha-vm/nftables.conf` | generated isolation ruleset, included from `/etc/nftables.conf` |
 | `/var/lib/gha-vm/golden.qcow2` | golden image, backing file for every overlay |
+| `/var/lib/gha-vm/golden.qcow2.prev` | the previous golden image, for `rollback` |
 | `/var/lib/gha-vm/run/<name>/` | one live VM: overlay, seed, UEFI vars, console log |
+| `/var/lib/gha-vm/run/.slot-<n>.drain` | drain flag; the slot idles while it exists |

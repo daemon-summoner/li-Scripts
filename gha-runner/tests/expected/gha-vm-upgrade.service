@@ -1,0 +1,16 @@
+[Unit]
+Description=Rebuild the gha-vm golden image on the latest runner release
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/gha-vm/config.env
+
+[Service]
+Type=oneshot
+Environment=GHA_CONFIG=/etc/gha-vm/config.env
+EnvironmentFile=-/etc/gha-vm/env
+ExecStart=/usr/local/lib/gha-vm/gha-vm.sh upgrade
+TimeoutStartSec=3h
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+PrivateTmp=true

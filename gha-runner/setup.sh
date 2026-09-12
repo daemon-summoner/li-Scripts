@@ -9,6 +9,7 @@
 #
 # Safe to re-run: every prompt defaults to what is already configured, so
 # pressing enter through it changes nothing.
+# --- end usage ---
 set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -50,7 +51,7 @@ ask() { # ask VAR "prompt" [default]
 	if [[ -n "$def" ]]; then
 		printf '    %s [%s%s%s]: ' "$prompt" "$c_b" "$def" "$c_0"
 	else printf '    %s: ' "$prompt"; fi
-	IFS= read -r ans || die "input ended; nothing was installed"
+	IFS= read -r ans || die "input ended; setup aborted, re-run ./setup.sh to continue"
 	[[ -z "$ans" ]] && ans="$def"
 	printf -v "$__var" '%s' "$ans"
 }
@@ -58,7 +59,7 @@ ask() { # ask VAR "prompt" [default]
 ask_secret() { # ask_secret VAR "prompt" [keep-if-empty]
 	local __var="$1" prompt="$2" keep="${3:-}" ans
 	printf '    %s%s: ' "$prompt" "${keep:+ (enter to keep current)}"
-	IFS= read -rs ans || die "input ended; nothing was installed"
+	IFS= read -rs ans || die "input ended; setup aborted, re-run ./setup.sh to continue"
 	printf '\n'
 	[[ -z "$ans" ]] && ans="$keep"
 	printf -v "$__var" '%s' "$ans"
@@ -73,14 +74,14 @@ ask_key() { # ask_key VAR
 	local __var="$1" line body="" lines=0 src
 	info 'Private key (step 8): paste the whole PEM block, or give a path to the .pem'
 	printf '    '
-	IFS= read -r line || die "input ended; nothing was installed"
+	IFS= read -r line || die "input ended; setup aborted, re-run ./setup.sh to continue"
 	line="${line%$'\r'}"
 
 	if [[ "$line" == *"-----BEGIN "*"PRIVATE KEY-----"* ]]; then
 		body="$line"
 		while [[ "$line" != *"-----END "*"PRIVATE KEY-----"* ]]; do
 			IFS= read -r line ||
-				die "input ended before the key's END line; nothing was installed"
+				die "input ended before the key's END line; setup aborted, re-run ./setup.sh to continue"
 			line="${line%$'\r'}"
 			# A paste that never terminates would otherwise read forever. A 4096-bit
 			# key is about 51 lines.
@@ -91,7 +92,7 @@ ask_key() { # ask_key VAR
 			body+=$'\n'"$line"
 		done
 	else
-		src="${line/#\~/$HOME}"
+		src="${line/#\~/$(invoker_home)}"
 		[[ -n "$src" ]] || {
 			warn "nothing entered"
 			return 1
@@ -117,7 +118,7 @@ ask_yn() { # ask_yn "prompt" [y|n]
 	[[ "$def" == y ]] && h="Y/n" || h="y/N"
 	while :; do
 		printf '    %s [%s]: ' "$prompt" "$h"
-		IFS= read -r ans || die "input ended; nothing was installed"
+		IFS= read -r ans || die "input ended; setup aborted, re-run ./setup.sh to continue"
 		case "${ans:-$def}" in
 		[yY] | [yY][eE][sS]) return 0 ;;
 		[nN] | [nN][oO]) return 1 ;;
@@ -130,7 +131,7 @@ ask_choice() { # ask_choice VAR "prompt" default opt1 opt2 ...
 	shift 3
 	while :; do
 		printf '    %s (%s) [%s%s%s]: ' "$prompt" "$*" "$c_b" "$def" "$c_0"
-		IFS= read -r ans || die "input ended; nothing was installed"
+		IFS= read -r ans || die "input ended; setup aborted, re-run ./setup.sh to continue"
 		ans="${ans:-$def}"
 		local o
 		for o in "$@"; do
@@ -144,39 +145,33 @@ ask_choice() { # ask_choice VAR "prompt" default opt1 opt2 ...
 
 # ---------------------------------------------------------------- config ----
 
-# Current value of KEY in the config, empty if unset or the file is absent.
+# Home of the user who ran sudo, for expanding a pasted ~/path. Under sudo
+# $HOME is root's.
+invoker_home() {
+	local h=""
+	if [[ -n "${SUDO_USER:-}" ]]; then
+		h="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+	fi
+	printf '%s' "${h:-$HOME}"
+}
+
+# Effective value of KEY after config.env, the host profile, local.env and
+# the built-in defaults; empty when the config is absent.
 cfg_get() {
 	[[ -r "$CONFIG" ]] || return 0
-	(
-		set +eu
-		# shellcheck disable=SC1090
-		source "$CONFIG" >/dev/null 2>&1
-		printf '%s' "${!1:-}"
-	)
+	"$GHA" config "$1"
 }
 
-# Replace the first "KEY=" or "#KEY=" line in place, else append. Rewrites
-# through the original file so ownership and mode are preserved.
-cfg_set() { cfg_set_in "$CONFIG" "$@"; }
-
-# Rewrites through the original file so its owner and mode survive.
-cfg_set_in() {
-	local file="$1" key="$2" val="$3" tmp
-	tmp="$(mktemp)"
-	KEY="$key" VAL="$val" awk '
-		BEGIN { k = ENVIRON["KEY"]; v = ENVIRON["VAL"]; done = 0 }
-		!done && $0 ~ ("^#?" k "=") { print k "=" v; done = 1; next }
-		{ print }
-		END { if (!done) print k "=" v }
-	' "$file" >"$tmp"
-	cat "$tmp" >"$file"
-	rm -f "$tmp"
-}
+# Atomic in-place edits through gha-vm.sh, which quotes values, keeps owner
+# and mode, and comments out duplicate live keys.
+cfg_set() { "$GHA" config-set "$1" "$2" "$CONFIG"; }
+cfg_unset() { "$GHA" config-unset "$1" "$CONFIG"; }
+cfg_set_in() { "$GHA" config-set "$2" "$3" "$1"; }
 
 # ------------------------------------------------------------------ main ----
 
 usage() {
-	sed -n '3,11p' "$(readlink -f "$0")" | sed 's/^# \?//'
+	sed -n '3,/^# --- end usage ---$/{/^# --- end usage ---$/!p}' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//'
 	exit "${1:-0}"
 }
 
@@ -209,11 +204,12 @@ fi
 
 [[ -x "$GHA" ]] || die "gha-vm.sh not found next to this script ($GHA)"
 
-# A pipe or a cron job has nobody to answer prompts; fall through to the
-# scripted path rather than blocking forever on read.
-if ((NONINTERACTIVE)) || [[ ! -t 0 ]]; then
+# A pipe or a cron job has nobody to answer prompts. -y takes the scripted
+# path; without it, stopping here beats blocking forever on the first read.
+if ((NONINTERACTIVE)); then
 	exec "$GHA" bootstrap ${SLOTS:+"$SLOTS"}
 fi
+[[ -t 0 ]] || die "stdin is not a terminal; use -y for non-interactive setup"
 
 printf '\n%sgha-vm setup%s  --  ephemeral GitHub Actions runners in throwaway KVM VMs\n' "$c_b" "$c_0"
 hint "on $(hostname -s), $(nproc) cores, $(($(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024 / 1024))G RAM"
@@ -259,6 +255,8 @@ cur_appid="$(cfg_get GITHUB_APP_ID)"
 cur_pat="$(cfg_get GITHUB_PAT)"
 cur_key="$(cfg_get GITHUB_APP_KEY)"
 cur_key="${cur_key:-$CONFIG_DIR/app.pem}"
+server_url="$(cfg_get GITHUB_SERVER_URL)"
+server_url="${server_url:-https://github.com}"
 
 hint "org scope gives one runner pool for every repo. A personal account has no"
 hint "such scope -- there, pick repo, one pool per repo."
@@ -272,6 +270,7 @@ if [[ "$scope" == org ]]; then
 	done
 	cfg_set SCOPE org
 	cfg_set GITHUB_ORG "$org"
+	[[ -n "$cur_repo" ]] && cfg_unset GITHUB_REPO
 else
 	while :; do
 		ask repo "Repository (owner/name)" "$cur_repo"
@@ -280,6 +279,7 @@ else
 	done
 	cfg_set SCOPE repo
 	cfg_set GITHUB_REPO "$repo"
+	[[ -n "$cur_org" ]] && cfg_unset GITHUB_ORG
 fi
 
 printf '\n'
@@ -291,19 +291,19 @@ if [[ "$mode" == app ]]; then
 	# The two JIT-runner endpoints need different permissions; naming the wrong
 	# one here is the most common way this setup fails at the first job.
 	if [[ "$scope" == org ]]; then
-		app_new="https://github.com/organizations/$org/settings/apps/new"
-		app_list="https://github.com/organizations/$org/settings/apps"
+		app_new="$server_url/organizations/$org/settings/apps/new"
+		app_list="$server_url/organizations/$org/settings/apps"
 		app_perm='Organization permissions > "Self-hosted runners" > Read and write'
 		app_where="the $org organization"
 	else
-		app_new="https://github.com/settings/apps/new"
-		app_list="https://github.com/settings/apps"
+		app_new="$server_url/settings/apps/new"
+		app_list="$server_url/settings/apps"
 		app_perm='Repository permissions > "Administration" > Read and write'
 		app_where="the $repo repository"
 	fi
 
 	printf '\n'
-	info "Create the app on github.com (about two minutes):"
+	info "Create the app on ${server_url#https://} (about two minutes):"
 	hint "  $app_new"
 	info "  1. GitHub App name:  anything unique, e.g. gha-vm-runners"
 	info "  2. Homepage URL:     required but unused -- any URL will do"
@@ -370,11 +370,13 @@ if [[ "$mode" == app ]]; then
 	cfg_set AUTH_MODE app
 	cfg_set GITHUB_APP_ID "$appid"
 	cfg_set GITHUB_APP_KEY "$keypath"
+	# A PAT left behind would be a live credential nothing uses.
+	[[ -n "$cur_pat" ]] && cfg_unset GITHUB_PAT
 else
 	warn "a PAT is stored in plain text in $CONFIG and does not expire on its own."
 	printf '\n'
 	info "Create a classic token at:"
-	hint "  https://github.com/settings/tokens/new"
+	hint "  $server_url/settings/tokens/new"
 	if [[ "$scope" == org ]]; then
 		info "  Scope needed: admin:org"
 		info "  If $org enforces SSO, click \"Configure SSO\" on the token"
@@ -389,7 +391,7 @@ else
 		warn "cannot be empty"
 	done
 	cfg_set AUTH_MODE pat
-	cfg_set GITHUB_PAT "$pat"
+	"$GHA" config-set GITHUB_PAT - "$CONFIG" <<<"$pat"
 fi
 good "credentials written to $CONFIG"
 
@@ -397,28 +399,44 @@ good "credentials written to $CONFIG"
 
 step "3/6  VM size per slot"
 
-# A host profile is sourced after config.env, so it -- not config.env -- decides
-# sizing on a machine that has one. Write the answers where they take effect.
-prof_out="$("$GHA" profile)"
-# `profile` echoes capacity after its own summary and both print a "profile"
-# line; exit on the first so this reads the header, not the capacity repeat.
-prof_name="$(printf '%s\n' "$prof_out" | awk '/^profile /{print $2; exit}')"
-prof_file="$(printf '%s\n' "$prof_out" | awk '/^loaded from/ && $3 !~ /^\(none/ {print $3; exit}')"
-sizing_file="$CONFIG"
+# Sizing answers go to local.env, the per-host override that is sourced after
+# config.env and the shipped profile, so they take effect on a machine with a
+# profile and survive `deps` refreshing the profiles.
+prof_name="$(cfg_get HOST_PROFILE)"
+prof_file="$(cfg_get PROFILE_FILE)"
+sizing_file="$(cfg_get LOCAL_FILE)"
+[[ -n "$sizing_file" ]] || die "gha-vm.sh config LOCAL_FILE returned nothing; is $GHA current?"
 if [[ -n "$prof_file" ]]; then
-	sizing_file="$prof_file"
-	info "This host matches profile '$prof_name'."
-	hint "  Sizing comes from $prof_file, which overrides $CONFIG."
-	hint "  Answers below are written there."
+	info "This host matches profile '$prof_name' ($prof_file)."
+fi
+hint "  Answers below are written to $sizing_file, which overrides both."
+if [[ ! -e "$sizing_file" ]]; then
+	gha_group="$(cfg_get GHA_USER)"
+	install -d -o root -g "${gha_group:-gha}" -m 0750 "$(dirname "$sizing_file")"
+	printf '# Per-host overrides written by setup.sh; sourced after the profile.\n' |
+		install -o root -g "${gha_group:-gha}" -m 0640 /dev/stdin "$sizing_file" ||
+		die "could not create $sizing_file"
 fi
 
-cur_cpus="$(printf '%s\n' "$prof_out" | awk '/^  VM_CPUS/{print $2; exit}')"
-cur_mem="$(printf '%s\n' "$prof_out" | awk '/^  VM_MEM/{print $2; exit}')"
-cur_disk="$(printf '%s\n' "$prof_out" | awk '/^  VM_DISK/{print $2; exit}')"
+cur_cpus="$(cfg_get VM_CPUS)"
+cur_mem="$(cfg_get VM_MEM)"
+cur_disk="$(cfg_get VM_DISK)"
 hint "One slot = one VM = one concurrent job. These are per-slot, not totals."
-ask cpus "vCPUs per job" "${cur_cpus:-4}"
-ask mem "Memory per job (e.g. 8G)" "${cur_mem:-8G}"
-ask disk "Max disk per job (e.g. 80G, thin-provisioned)" "${cur_disk:-80G}"
+while :; do
+	ask cpus "vCPUs per job" "${cur_cpus:-4}"
+	[[ "$cpus" =~ ^[1-9][0-9]*$ ]] && break
+	warn "a positive whole number, e.g. 4"
+done
+while :; do
+	ask mem "Memory per job (e.g. 8G)" "${cur_mem:-8G}"
+	[[ "$mem" =~ ^[0-9]+[MGmg]?$ ]] && ((10#${mem%[MGmg]} > 0)) && break
+	warn "a size like 8G or 8192M"
+done
+while :; do
+	ask disk "Max disk per job (e.g. 80G, thin-provisioned)" "${cur_disk:-80G}"
+	[[ "$disk" =~ ^[0-9]+[MGTmgt]$ ]] && break
+	warn "a size with a unit, like 80G"
+done
 cfg_set_in "$sizing_file" VM_CPUS "$cpus"
 cfg_set_in "$sizing_file" VM_MEM "$mem"
 cfg_set_in "$sizing_file" VM_DISK "$disk"
@@ -426,8 +444,8 @@ cfg_set_in "$sizing_file" VM_DISK "$disk"
 # --- 4. image --------------------------------------------------------------
 
 step "4/6  Golden image"
-golden="$(cfg_get STATE_DIR)"
-golden="${golden:-/var/lib/gha-vm}/golden.qcow2"
+golden="$(cfg_get GOLDEN)"
+golden="${golden:-/var/lib/gha-vm/golden.qcow2}"
 if [[ -f "$golden" ]]; then
 	good "already built: $golden ($(du -h "$golden" | cut -f1))"
 	if ask_yn "Rebuild it? (downloads Ubuntu, ~10 minutes)" n; then
@@ -444,8 +462,9 @@ fi
 # --- 5. isolation ----------------------------------------------------------
 
 step "5/6  Network isolation"
-info "Blocks jobs from reaching this host's own services, your LAN and the"
-info "cloud metadata address. DNS stays open."
+info "Blocks jobs from reaching this host's own services and addresses, your"
+info "LAN, the cloud metadata address and other non-routable ranges. DNS stays"
+info "open, and NET_ALLOW_CIDRS in $CONFIG punches holes for a LAN mirror."
 "$GHA" net || die "could not apply the isolation rules"
 good "isolation active and set to reload at boot"
 
@@ -493,8 +512,10 @@ printf '\n'
 info "watch jobs      journalctl -fu 'gha-vm@*'"
 info "check state     gha-vm status"
 info "resize fleet    sudo gha-vm install <n>"
+info "pause a slot    sudo gha-vm drain <n>   (undrain to resume)"
+info "roll back       sudo gha-vm rollback   (previous golden image)"
 info "remove          sudo gha-vm uninstall"
 printf '\n'
 hint "Runners appear under the $scope's Actions > Runners settings within a minute."
-hint "Target them with:  runs-on: [self-hosted, linux, x64]"
+hint "Target them with:  runs-on: [self-hosted, linux, $(cfg_get RUNNER_ARCH)]"
 printf '\n'

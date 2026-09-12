@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Audit every git repo under a directory for gha-vm self-hosted compatibility.
 
-Usage: adopt-runners.py [ROOT] [--apply] [--label L[,L...]] [-q] [--no-blockers]
+Usage: adopt-runners.py [ROOT] [--apply] [--arch x64|arm64] [--label L[,L...]]
+                        [-q] [--no-blockers]
 Reports jobs pinned to GitHub-hosted runners and steps that would break on the
 golden image; --apply rewrites the movable `runs-on` lines in place.
 """
@@ -38,10 +39,41 @@ except ImportError:
     )
 
 # GitHub's Linux images, including the -arm variants and the dated pins. Only
-# these are offered for rewriting: a job is portable to this hardware exactly
-# when it already expects Linux/x64.
-HOSTED_LINUX = re.compile(r"^ubuntu-(?:latest|\d{2}\.\d{2})(?:-arm)?$")
+# these are offered for rewriting, and only when the image's architecture is
+# the one the fleet runs (--arch): a job is portable to this hardware exactly
+# when it already expects Linux on the same CPU family.
+HOSTED_LINUX = re.compile(r"^ubuntu-(?:latest|\d{2}\.\d{2})(?P<arm>-arm)?$")
 FOREIGN = re.compile(r"^(?:windows|macos|macOS)-")
+ARCHES = ("x64", "arm64")
+# An opening bracket without its close, or a block scalar indicator.
+CONTINUES = re.compile(r"^(\[(?!.*\]$)|\{(?!.*\}$)|[|>][-+0-9]*$)")
+
+
+def unsafe_head(head):
+    """Why a value cannot be replaced from its first line alone, or None.
+
+    Only that line is known, so anything that continues below it, or that
+    another job refers back to, would be cut in half by a rewrite.
+    """
+    if CONTINUES.match(head):
+        return "value spans several lines"
+    q = head[:1]
+    if q in ('"', "'") and (
+        len(head) < 2 or not head.endswith(q) or head.endswith("\\" + q)
+    ):
+        return "quoted value spans several lines"
+    if q in ("&", "*", "!"):
+        return "anchor, alias or tag on the value"
+    return None
+
+
+def hosted_arch(label):
+    """Architecture a GitHub-hosted Linux label targets, or None if not hosted."""
+    m = HOSTED_LINUX.match(label)
+    if not m:
+        return None
+    return "arm64" if m.group("arm") else "x64"
+
 
 # What `gha-vm.sh image` installs, plus the Ubuntu base. Anything a workflow
 # reaches for that is not here fails at the first `run:` step that uses it.
@@ -50,8 +82,10 @@ MISSING = [
     (
         ("node", "npm", "npx", "yarn", "pnpm"),
         "no Node toolchain on the image",
-        "add actions/setup-node (the runner's bundled Node serves JS actions only,"
-        " it is not on PATH for run: steps)",
+        (
+            "add actions/setup-node (the runner's bundled Node serves JS actions only,"
+            " it is not on PATH for run: steps)"
+        ),
     ),
     (("pip", "pip3"), "python3-pip is not installed", "add actions/setup-python"),
     (
@@ -132,7 +166,7 @@ def uses_cmd(script, cmd):
         pat = re.compile(
             r"(?:^|[\n;|&(]|\$\(|`|\bsudo\s+|\benv\s+|\bxargs\s+|\btime\s+|\bthen\s+|\bdo\s+)"
             r"\s*" + re.escape(cmd) + r"(?=\s|$|;|&|\||\))",
-            re.M,
+            re.MULTILINE,
         )
         _CMD_RE[cmd] = pat
     return bool(pat.search(script))
@@ -187,13 +221,21 @@ def job_blockers(job):
     return found
 
 
-def classify(value):
-    """Bucket a runs-on value: movable, already-ours, foreign, or manual."""
+def classify(value, arch):
+    """Bucket a runs-on value: movable, already-ours, foreign, or manual.
+
+    `arch` is the fleet's runner architecture. A hosted Linux image for the
+    other CPU family is reported manual: rewriting it would hand an arm64 job to
+    x64 hardware (or vice versa) and the failure only shows at build time.
+    """
     if isinstance(value, str):
         if "${{" in value:
             return "manual", "expression: " + value.strip()
-        if HOSTED_LINUX.match(value):
+        hosted = hosted_arch(value)
+        if hosted == arch:
             return "hosted", value
+        if hosted:
+            return "manual", f"hosted {hosted} image, fleet is {arch}: {value}"
         if FOREIGN.match(value):
             return "foreign", value
         return "self", value
@@ -201,10 +243,16 @@ def classify(value):
         labels = [v for v in value if isinstance(v, str)]
         if len(labels) != len(value) or any("${{" in v for v in labels):
             return "manual", "non-scalar list"
+        if not labels:
+            return "manual", "empty list"
         shown = ", ".join(labels)
         if any(FOREIGN.match(v) for v in labels):
             return "foreign", shown
-        hosted = [bool(HOSTED_LINUX.match(v)) for v in labels]
+        arches = [hosted_arch(v) for v in labels]
+        other = sorted({a for a in arches if a and a != arch})
+        if other:
+            return "manual", f"hosted {'/'.join(other)} image, fleet is {arch}: {shown}"
+        hosted = [bool(a) for a in arches]
         if all(hosted):
             return "hosted", shown
         if any(hosted):
@@ -241,19 +289,27 @@ def plan_edit(lines, job_map, new_text):
         m = re.match(r"^(\s*runs-on\s*:\s*)(.*?)(\s+#.*)?$", lines[kline])
         if not m:
             return None, "runs-on line did not parse"
+        why = unsafe_head(m.group(2).strip())
+        if why:
+            return None, f"{why}; rewrite it by hand"
         return (kline, kline + 1, m.group(1) + new_text + (m.group(3) or "")), None
 
     seq = job_map["runs-on"]
     if not isinstance(seq, list) or not len(seq):
         return None, "block value is not a list"
     try:
-        last = max(seq.lc.item(i)[0] for i in range(len(seq)))
+        item_lines = [seq.lc.item(i)[0] for i in range(len(seq))]
     except (AttributeError, TypeError):
         return None, "could not measure the block list"
+    last = max(item_lines)
 
     # A comment inside the range would be destroyed by collapsing it to one line.
     if any("#" in lines[i] for i in range(kline, last + 1)):
         return None, "comments inside the runs-on block; rewrite it by hand"
+    for i in item_lines:
+        why = unsafe_head(re.sub(r"^\s*-\s*", "", lines[i]).strip())
+        if why:
+            return None, f"list item: {why}; rewrite it by hand"
     return (kline, last + 1, " " * kcol + "runs-on: " + new_text), None
 
 
@@ -279,6 +335,7 @@ def is_dirty(repo):
         ["git", "-C", str(repo), "status", "--porcelain"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "git status failed")
@@ -298,9 +355,15 @@ def main():
         help="rewrite movable runs-on values (skips dirty repos)",
     )
     ap.add_argument(
+        "--arch",
+        choices=ARCHES,
+        default="x64",
+        help="fleet runner architecture; hosted images for the other family are "
+        "reported MANUAL instead of rewritten (default: x64)",
+    )
+    ap.add_argument(
         "--label",
-        default="self-hosted",
-        help="comma-separated labels to write (default: self-hosted)",
+        help="comma-separated labels to write (default: self-hosted,linux,<arch>)",
     )
     ap.add_argument(
         "--no-blockers",
@@ -316,7 +379,10 @@ def main():
     if not root.is_dir():
         sys.exit(f"not a directory: {root}")
 
-    labels = [s.strip() for s in args.label.split(",") if s.strip()]
+    label_text = (
+        args.label if args.label is not None else f"self-hosted,linux,{args.arch}"
+    )
+    labels = [s.strip() for s in label_text.split(",") if s.strip()]
     if not labels:
         sys.exit("--label needs at least one label")
     new_text = render(labels)
@@ -324,18 +390,18 @@ def main():
     yaml = YAML(typ="rt")
     yaml.preserve_quotes = True
 
-    counts = dict(
-        repos=0,
-        files=0,
-        jobs=0,
-        hosted=0,
-        moved=0,
-        self=0,
-        manual=0,
-        foreign=0,
-        blocked=0,
-        skipped=0,
-    )
+    counts = {
+        "repos": 0,
+        "files": 0,
+        "jobs": 0,
+        "hosted": 0,
+        "moved": 0,
+        "self": 0,
+        "manual": 0,
+        "foreign": 0,
+        "blocked": 0,
+        "skipped": 0,
+    }
 
     for repo in find_repos(root):
         wf_dir = repo / ".github" / "workflows"
@@ -359,7 +425,11 @@ def main():
 
         repo_lines = []
         for path in files:
-            text = path.read_text(encoding="utf-8")
+            # Line endings are kept as found: ruamel counts "\n" only, and
+            # the file goes back with the same terminator it came with.
+            with path.open(encoding="utf-8", newline="") as fh:
+                text = fh.read()
+            nl = "\r\n" if "\r\n" in text else "\n"
             try:
                 doc = yaml.load(text)
             except YAMLError as e:
@@ -372,7 +442,7 @@ def main():
                 continue
             counts["files"] += 1
 
-            lines = text.splitlines()
+            lines = text.split(nl)
             edits, out = [], []
 
             for jid, job in doc["jobs"].items():
@@ -392,7 +462,7 @@ def main():
                     counts["manual"] += 1
                     continue
 
-                kind, shown = classify(job["runs-on"])
+                kind, shown = classify(job["runs-on"], args.arch)
                 counts[kind] += 1
 
                 if kind == "hosted":
@@ -409,7 +479,7 @@ def main():
                         out.append(f"    {jid:<24} MANUAL  {why}")
                 elif kind == "foreign":
                     out.append(
-                        f"    {jid:<24} FOREIGN {shown}; this fleet is linux/x64 only"
+                        f"    {jid:<24} FOREIGN {shown}; this fleet is linux/{args.arch} only"
                     )
                 elif kind == "manual":
                     out.append(f"    {jid:<24} MANUAL  {shown}")
@@ -427,10 +497,8 @@ def main():
             if edits:
                 for start, end, repl in sorted(edits, reverse=True):
                     lines[start:end] = [repl]
-                path.write_text(
-                    "\n".join(lines) + ("\n" if text.endswith("\n") else ""),
-                    encoding="utf-8",
-                )
+                with path.open("w", encoding="utf-8", newline="") as fh:
+                    fh.write(nl.join(lines))
             if out:
                 repo_lines.append(f"  {path.name}\n" + "\n".join(out))
 
@@ -446,17 +514,17 @@ def main():
 
     c = counts
     print(f"\n{c['repos']} repos, {c['files']} workflows, {c['jobs']} jobs")
-    print(f"  movable to self-hosted  {c['hosted']}")
+    print(f"  movable to self-hosted    {c['hosted']}")
     print(
-        f"  rewritten               {c['moved']}"
+        f"  rewritten                 {c['moved']}"
         + ("" if args.apply else "   (--apply to rewrite)")
     )
-    print(f"  already self-hosted     {c['self']}")
-    print(f"  need a human            {c['manual']}")
-    print(f"  linux/x64 incompatible  {c['foreign']}")
-    print(f"  jobs with blockers      {c['blocked']}")
+    print(f"  already self-hosted       {c['self']}")
+    print(f"  need a human              {c['manual']}")
+    print(f"  {f'linux/{args.arch} incompatible':<26}{c['foreign']}")
+    print(f"  jobs with blockers        {c['blocked']}")
     if c["skipped"]:
-        print(f"  skipped                 {c['skipped']}")
+        print(f"  skipped                   {c['skipped']}")
 
     return 1 if c["blocked"] else 0
 

@@ -11,13 +11,32 @@ time each host picks **one** of them:
 4. `/etc/gha-vm/profiles/default.env` — a fleet-wide fallback, if you ship one
 5. nothing — built-in defaults plus autotune
 
+Steps 1-3 decide the name; `default.env` is only read when that name has no
+file. Neither a profile file nor `local.env` can change `HOST_PROFILE`
+itself; a line doing so is ignored with a warning.
+
 Profiles are sourced **after** `config.env`, so anything a profile sets wins.
 Put credentials and scope in `config.env`; put sizing in a profile.
 
-Check what a machine resolved to:
+## `local.env`
+
+`/etc/gha-vm/profiles/local.env` is sourced last, after whichever profile was
+picked, and `deps` never writes it. It is the place for a setting that belongs
+to this one machine and should survive the checkout's profiles being
+reinstalled: `setup.sh` writes the sizing answers there, and anything you set
+by hand (`MAX_SLOTS=3` while the box is borrowed for something else) goes there
+too. Precedence, lowest to highest:
+
+```
+built-in defaults  <  config.env  <  the profile  <  local.env
+```
+
+Check which files a machine loaded, and what every value resolved to:
 
 ```bash
-gha-vm profile
+gha-vm profile           # the profile and local.env in effect
+gha-vm config            # every effective value
+gha-vm config MAX_SLOTS  # one of them
 ```
 
 ## You usually do not need one
