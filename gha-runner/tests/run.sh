@@ -193,7 +193,9 @@ $verify_out"
 	# restart: an idle runner is not a running job. Slots 2 (idle) and 3 (a
 	# job's run dir left by a killed supervisor) restart at once, slot 1 once
 	# its job finishes, and a failed restart of slot 4 is reported without
-	# leaving any slot drained.
+	# leaving any slot drained. Slot 5's supervisor is live with an idle VM
+	# (a stand-in process in its unit's cgroup): restart stops that VM itself,
+	# so a supervisor from an older script never waits out its grace period.
 	local rs=$fl/restart rrun=$fl/restart/run
 	install -d "$rs/bin" "$rrun/gha-test-1-aaaa" "$rrun/gha-test-2-bbbb" "$rrun/gha-test-3-cccc"
 	printf 'GHA-VM: runner starting\n2026-01-01 00:00:00Z: Running job: build\n' >"$rrun/gha-test-1-aaaa/console.log"
@@ -203,10 +205,19 @@ $verify_out"
 	local sup1=$!
 	sleep 1
 	printf 'GHA-VM: runner starting\n2026-01-01 00:00:00Z: Listening for Jobs\n' >"$rrun/gha-test-2-bbbb/console.log"
+	install -d "$rrun/gha-test-5-eeee" "$rs/cg/u/gha-vm@5.service"
+	cp "$rrun/gha-test-2-bbbb/console.log" "$rrun/gha-test-5-eeee/console.log"
+	: >"$rrun/.slot-5.lock"
+	flock "$rrun/.slot-5.lock" sleep 60 &
+	local sup5=$!
+	perl -e 'sleep 60' -- -name gha-test-5-eeee &
+	local vm5=$!
+	echo "$vm5" >"$rs/cg/u/gha-vm@5.service/cgroup.procs"
 	cat >"$rs/bin/systemctl" <<SH
 #!/bin/bash
 case "\$1" in
-list-units) printf 'gha-vm@%s.service loaded active running x\\n' 1 2 3 4 ;;
+list-units) printf 'gha-vm@%s.service loaded active running x\\n' 1 2 3 4 5 ;;
+show) echo "/u/\$5" ;;
 restart)
 	echo "\$2" >>"$rs/log"
 	[[ "\$2" != gha-vm@4.service ]]
@@ -218,17 +229,23 @@ SH
 	(sleep 3 && rm -rf "$rrun/gha-test-1-aaaa") &
 	local finisher=$! rout rrc=0 t0
 	t0=$(date +%s)
-	rout="$(PATH="$rs/bin:$PATH" GHA_CONFIG=$fl/cfg.env "$gha" restart all 2>&1)" || rrc=$?
+	rout="$(PATH="$rs/bin:$PATH" GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$rs/cg "$gha" restart all 2>&1)" || rrc=$?
 	wait "$finisher"
-	kill "$sup1"
-	wait "$sup1" || :
+	kill "$sup1" "$sup5"
+	wait "$sup1" "$sup5" || :
+	if kill -0 "$vm5" 2>/dev/null; then
+		kill "$vm5"
+		fail "restart left slot 5's idle VM running: $rout"
+	fi
+	wait "$vm5" || :
+	grep -q 'slot 5: gha-test-5-eeee has no job; stopping it' <<<"$rout" || fail "restart did not stop slot 5's idle VM: $rout"
 	((rrc != 0)) || fail "restart succeeded although slot 4 failed: $rout"
 	grep -q 'slot 4: ERROR could not restart' <<<"$rout" || fail "restart did not report slot 4: $rout"
-	[[ "$(sed -n 1,3p "$rs/log" | sort | tr '\n' ' ')" == "gha-vm@2.service gha-vm@3.service gha-vm@4.service " ]] ||
+	[[ "$(sed -n 1,4p "$rs/log" | sort | tr '\n' ' ')" == "gha-vm@2.service gha-vm@3.service gha-vm@4.service gha-vm@5.service " ]] ||
 		fail "idle slots did not restart ahead of the busy one: $(cat "$rs/log")"
-	[[ "$(sed -n 4p "$rs/log")" == gha-vm@1.service ]] || fail "busy slot 1 not restarted after its job: $(cat "$rs/log")"
+	[[ "$(sed -n 5p "$rs/log")" == gha-vm@1.service ]] || fail "busy slot 1 not restarted after its job: $(cat "$rs/log")"
 	grep -q 'slot 1: waiting for the current job to finish (0s)' <<<"$rout" || fail "restart did not wait on slot 1's job: $rout"
-	! grep -q 'slot [23]: waiting' <<<"$rout" || fail "restart waited on idle slot 2 or dead slot 3: $rout"
+	! grep -q 'slot [235]: waiting' <<<"$rout" || fail "restart waited on an idle or dead slot: $rout"
 	(($(date +%s) - t0 < 30)) || fail "restart took too long"
 	! compgen -G "$rrun/.slot-*.drain" >/dev/null || fail "restart left drain flags behind: $(ls -a "$rrun")"
 	pass "restart skips idle runners, waits for jobs, reports failures"
