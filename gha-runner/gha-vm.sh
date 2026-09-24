@@ -14,6 +14,7 @@
 #   gha-vm.sh install [count]   install scripts + systemd units (count defaults to the installed fleet size, else 2)
 #   gha-vm.sh uninstall         stop and remove units
 #   gha-vm.sh status            slot and runner status
+#   gha-vm.sh fleet             shared memory budget, use, and slots waiting for room
 #   gha-vm.sh upgrade [--check] pin the latest runner release, rebuild the image
 #   gha-vm.sh rollback          swap golden.qcow2.prev back into place
 #   gha-vm.sh drain|undrain [slot|all]   finish the current job, then take no more
@@ -54,6 +55,12 @@ PROFILE_DIR="${GHA_PROFILE_DIR:-/etc/gha-vm/profiles}"
 UNIT="$SYSTEMD_DIR/gha-vm@.service"
 UPGRADE_UNIT="$SYSTEMD_DIR/gha-vm-upgrade.service"
 UPGRADE_TIMER="$SYSTEMD_DIR/gha-vm-upgrade.timer"
+# No dash in the name: systemd reads a dash as nesting, so gha-vm.slice would
+# live at gha.slice/gha-vm.slice and every cgroup path below would miss it.
+FLEET_SLICE="$SYSTEMD_DIR/ghavm.slice"
+# cgroup v2 mount; overridable so the fleet accounting can be read from a
+# fixture tree.
+CGROUP_ROOT="${GHA_CGROUP_ROOT:-/sys/fs/cgroup}"
 
 # Guest prints this on the serial console once it is about to start the runner.
 # Absence of it inside BOOT_TIMEOUT means the VM never came up; kill it rather
@@ -176,6 +183,16 @@ apply_defaults() {
 	CPU_OVERCOMMIT="${CPU_OVERCOMMIT:-2}"
 	DISK_PER_SLOT_GB="${DISK_PER_SLOT_GB:-30}"
 
+	# Memory all runner VMs together may really use: auto is RAM minus
+	# HOST_RESERVE_GB, off drops both the ceiling and the admission wait.
+	FLEET_MEM="${FLEET_MEM:-auto}"
+	[[ "$FLEET_MEM" =~ ^[0-9]+$ ]] && FLEET_MEM="${FLEET_MEM}G"
+	# How far the slots' combined sizes may exceed FLEET_MEM when `capacity`
+	# recommends a slot count. Runtime safety comes from the admission wait.
+	MEM_OVERCOMMIT_PCT="${MEM_OVERCOMMIT_PCT:-100}"
+	HOST_ZRAM="${HOST_ZRAM:-1}"
+	HOST_ZRAM_SIZE="${HOST_ZRAM_SIZE:-min(ram / 4, 8192)}"
+
 	RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,${RUNNER_ARCH},vm,ephemeral,docker}"
 	RUNNER_LABELS_APPEND_HOST="${RUNNER_LABELS_APPEND_HOST:-1}"
 	RUNNER_GROUP_ID="${RUNNER_GROUP_ID:-1}"
@@ -292,7 +309,10 @@ autotune_reserve() {
 	done
 	total=$(($(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024 / 1024))
 	avail=$(($(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1024 / 1024))
-	used=$((total - avail))
+	# Runner VMs already running are the fleet's own memory, not another
+	# service's; counting them would shrink the fleet every time it is busy.
+	used=$((total - avail - $(fleet_resident_mb) / 1024))
+	((used < 0)) && used=0
 	want=$((used + AUTOTUNE_HEADROOM_GB))
 	if ((want > HOST_RESERVE_GB)); then
 		HOST_RESERVE_GB="$want"
@@ -374,6 +394,13 @@ validate_sizing() {
 		[[ "${!k}" =~ ^[0-9]+$ ]] || die "$k must be a whole number (got '${!k}')"
 	done
 	[[ "$DISK_PER_SLOT_GB" =~ ^[1-9][0-9]*$ ]] || die "DISK_PER_SLOT_GB must be a positive integer (got '$DISK_PER_SLOT_GB')"
+	[[ "$FLEET_MEM" =~ ^(auto|off|[0-9]+[MGmg])$ ]] || die "FLEET_MEM must be auto, off, or a size like 24G (got '$FLEET_MEM')"
+	[[ "$FLEET_MEM" =~ ^(auto|off)$ ]] || (($(mem_to_mb "$FLEET_MEM") > 0)) || die "FLEET_MEM must be above zero (got '$FLEET_MEM')"
+	[[ "$MEM_OVERCOMMIT_PCT" =~ ^[1-9][0-9]*$ ]] || die "MEM_OVERCOMMIT_PCT must be a positive whole percent (got '$MEM_OVERCOMMIT_PCT')"
+	[[ "$HOST_ZRAM" =~ ^[01]$ ]] || die "HOST_ZRAM must be 0 or 1 (got '$HOST_ZRAM')"
+	local zre='^[a-z0-9 ()/*+,.-]+$'
+	[[ "$HOST_ZRAM_SIZE" =~ $zre ]] || die "HOST_ZRAM_SIZE must be a zram-generator size expression like 'min(ram / 4, 8192)' (got '$HOST_ZRAM_SIZE')"
+	validate_slot_classes
 	local u
 	for u in GITHUB_SERVER_URL GITHUB_API_URL RUNNER_DOWNLOAD_BASE; do
 		[[ "${!u}" == https://* ]] || die "$u must start with https:// (got '${!u}')"
@@ -387,6 +414,279 @@ mem_to_mb() { # accepts 8G / 8192M / 8 (bare = GiB)
 	*M) printf '%s' "${v%M}" ;;
 	*) printf '%s' "$((v * 1024))" ;;
 	esac
+}
+
+# ----------------------------------------------------------- slot classes ----
+
+# A slot may run a bigger (or smaller) VM than the rest: VM_MEM_<n>,
+# VM_CPUS_<n> and RUNNER_LABELS_EXTRA_<n> override VM_MEM, VM_CPUS and add
+# labels for slot n, so workflows can target the big one by label.
+slot_mem() {
+	local k="VM_MEM_$1" v
+	v="${!k:-$VM_MEM}"
+	[[ "$v" =~ ^[0-9]+$ ]] && v="${v}G"
+	printf '%s' "$v"
+}
+slot_mem_mb() { mem_to_mb "$(slot_mem "$1")"; }
+slot_cpus() {
+	local k="VM_CPUS_$1"
+	printf '%s' "${!k:-$VM_CPUS}"
+}
+slot_labels() {
+	local k="RUNNER_LABELS_EXTRA_$1" l="$RUNNER_LABELS"
+	[[ -n "${!k:-}" ]] && l+=",${!k}"
+	printf '%s' "$l"
+}
+
+# Every per-slot key set anywhere in the config, one name per line.
+slot_class_keys() {
+	compgen -v | grep -E '^(VM_MEM|VM_CPUS|RUNNER_LABELS_EXTRA)_[0-9]+$' || :
+}
+
+# Slot numbers that carry any override, ascending.
+slot_class_slots() {
+	slot_class_keys | sed -E 's/.*_([0-9]+)$/\1/' | sort -nu
+}
+
+validate_slot_classes() {
+	local k n
+	while read -r k; do
+		[[ -n "$k" ]] || continue
+		n="${k##*_}"
+		[[ "$n" =~ ^[1-9][0-9]*$ ]] || die "$k: slots are numbered from 1"
+		case "$k" in
+		VM_MEM_*)
+			[[ "$(slot_mem "$n")" =~ ^[0-9]+[MGmg]$ ]] || die "$k must be like 16G or 16384M (got '${!k}')"
+			(($(slot_mem_mb "$n") > 0)) || die "$k must be above zero (got '${!k}')"
+			;;
+		VM_CPUS_*) [[ "${!k}" =~ ^[1-9][0-9]*$ ]] || die "$k must be a positive integer (got '${!k}')" ;;
+		esac
+	done < <(slot_class_keys)
+}
+
+# Points this process's VM_MEM, VM_CPUS and RUNNER_LABELS at slot $1's class;
+# only the slot supervisor calls it, once its slot number is known.
+apply_slot_class() {
+	VM_MEM="$(slot_mem "$1")"
+	VM_CPUS="$(slot_cpus "$1")"
+	RUNNER_LABELS="$(slot_labels "$1")"
+}
+
+# One line per slot 1..$1: "<slot> <mem MiB> <vcpus>".
+slot_class_table() {
+	local n
+	for ((n = 1; n <= $1; n++)); do
+		printf '%s %s %s\n' "$n" "$(slot_mem_mb "$n")" "$(slot_cpus "$n")"
+	done
+}
+
+# ----------------------------------------------------------- fleet memory ----
+#
+# The fleet shares one memory ceiling instead of each slot owning a fixed
+# share. All slot units run in ghavm.slice, whose MemoryHigh is the budget:
+# past it the kernel reclaims and swaps (zram) inside the slice, so the jobs
+# slow down rather than the host; MemoryMax, a margin above, is where one VM
+# is OOM-killed. A slot registers a runner only while the fleet's real use
+# plus that slot's full size fits in the budget, first come first served, so
+# idle slots cost what they touch and heavy load stops new jobs, not old ones.
+
+# FLEET_MEM resolved to MiB from config; empty when off.
+fleet_budget_mb() {
+	case "$FLEET_MEM" in
+	off) return 0 ;;
+	auto)
+		local ram
+		ram=$(($(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024))
+		printf '%s' "$((ram > HOST_RESERVE_GB * 1024 ? ram - HOST_RESERVE_GB * 1024 : 0))"
+		;;
+	*) mem_to_mb "$FLEET_MEM" ;;
+	esac
+}
+
+# Headroom between the slice's MemoryHigh and MemoryMax: QEMU's own
+# overhead and page cache for every VM, which the budget does not count.
+# With FLEET_MEM=auto the budget already runs up to the host reserve, so the
+# margin takes at most half of that reserve: the slice must hit its own
+# MemoryMax before the host-wide OOM killer picks a host process.
+fleet_slack_mb() {
+	local s=$(($1 / 16)) cap=$((HOST_RESERVE_GB * 512))
+	((s < 2048)) && s=2048
+	[[ "$FLEET_MEM" == auto ]] && ((s > cap)) && s=$cap
+	printf '%s' "$s"
+}
+
+# "<resident MiB> <swapped MiB>" held by the slot units matching $1 (a slot
+# number, default every slot): anonymous memory and shmem (guest RAM) plus
+# what the host swapped out of them. Page cache is left out: the kernel drops
+# it on demand, and overlay writes would otherwise read as load. Slot units
+# live in ghavm.slice, or in system.slice when rendered before it existed.
+fleet_mem_usage() {
+	local d cur file shmem swap res=0 sw=0 v units
+	if [[ -n "${1:-}" ]]; then
+		units=("$CGROUP_ROOT"/*/"gha-vm@$1.service")
+	else
+		units=("$CGROUP_ROOT"/*/gha-vm@*.service)
+	fi
+	for d in "${units[@]}"; do
+		[[ -r "$d/memory.current" ]] || continue
+		cur="$(<"$d/memory.current")"
+		read -r file shmem < <(awk '$1 == "file" { f = $2 } $1 == "shmem" { s = $2 } END { print f + 0, s + 0 }' "$d/memory.stat")
+		v=$((cur - file + shmem))
+		((v > 0)) && res=$((res + v))
+		# memory.swap.current is absent when the kernel accounts no swap to
+		# cgroups; nothing was swapped out of them then.
+		if [[ -r "$d/memory.swap.current" ]]; then
+			swap="$(<"$d/memory.swap.current")"
+			sw=$((sw + swap))
+		fi
+	done
+	printf '%s %s' "$((res / 1048576))" "$((sw / 1048576))"
+}
+fleet_resident_mb() {
+	local r s
+	read -r r s <<<"$(fleet_mem_usage "${1:-}")"
+	printf '%s' "$r"
+}
+fleet_used_mb() {
+	local r s
+	read -r r s <<<"$(fleet_mem_usage "${1:-}")"
+	printf '%s' "$((r + s))"
+}
+
+# A VM just admitted has touched almost none of its RAM yet, so for this long
+# after admission the rest of its size still counts against the fleet. That
+# keeps slots freed at the same moment from all fitting into one gap.
+FLEET_CLAIM_SEC=300
+
+claim_flag() { printf '%s/.slot-%s.claim' "$RUN_DIR" "$1"; }
+
+# MiB that slots admitted in the last FLEET_CLAIM_SEC may still grow into:
+# each one's size minus what it already uses. Claims of dead supervisors and
+# of slot $1 itself are skipped.
+fleet_claims_mb() {
+	local self="${1:-}" f k at need used total=0 now
+	now=$(date +%s)
+	for f in "$RUN_DIR"/.slot-*.claim; do
+		[[ -r "$f" ]] || continue
+		k="${f##*/.slot-}"
+		k="${k%.claim}"
+		[[ "$k" =~ ^[0-9]+$ && "$k" != "$self" ]] || continue
+		read -r at need <"$f" || continue
+		[[ "$at" =~ ^[0-9]+$ && "$need" =~ ^[0-9]+$ ]] || continue
+		((now - at < FLEET_CLAIM_SEC)) || continue
+		slot_is_live "$k" || continue
+		used="$(fleet_used_mb "$k")"
+		((need > used)) && total=$((total + need - used))
+	done
+	printf '%s' "$total"
+}
+
+# The budget in force: ghavm.slice's MemoryHigh when the slice is live, so
+# admission and the kernel's ceiling agree even if config.env changed since
+# the last install; the config value otherwise. Empty when FLEET_MEM=off.
+fleet_live_budget_mb() {
+	[[ "$FLEET_MEM" == off ]] && return 0
+	local f="$CGROUP_ROOT/ghavm.slice/memory.high" v
+	if [[ -r "$f" ]]; then
+		v="$(<"$f")"
+		if [[ "$v" =~ ^[0-9]+$ ]]; then
+			printf '%s' "$((v / 1048576))"
+			return 0
+		fi
+	fi
+	fleet_budget_mb
+}
+
+wait_flag() { printf '%s/.slot-%s.wait' "$RUN_DIR" "$1"; }
+
+# The earliest-waiting live slot other than $1 that queued before $2 (epoch
+# seconds; ties go to the lower slot). Empty when $1 is at the head. A wait
+# file whose supervisor is gone is ignored: it died without cleaning up.
+fleet_waiter_ahead() {
+	local slot="$1" since="$2" f k ts best="" best_ts=""
+	for f in "$RUN_DIR"/.slot-*.wait; do
+		[[ -r "$f" ]] || continue
+		k="${f##*/.slot-}"
+		k="${k%.wait}"
+		[[ "$k" =~ ^[0-9]+$ && "$k" != "$slot" ]] || continue
+		ts="$(<"$f")"
+		[[ "$ts" =~ ^[0-9]+$ ]] || continue
+		((ts < since || (ts == since && k < slot))) || continue
+		slot_is_live "$k" || continue
+		if [[ -z "$best" ]] || ((ts < best_ts || (ts == best_ts && k < best))); then
+			best="$k"
+			best_ts="$ts"
+		fi
+	done
+	printf '%s' "$best"
+}
+
+# Why slot $1 (needing $2 MiB, queued at $3) may not register a runner now
+# under a budget of $4 MiB. Empty means go.
+fleet_block_reason() {
+	local slot="$1" need="$2" since="$3" budget="$4" ahead used
+	[[ -n "$budget" ]] || return 0
+	ahead="$(fleet_waiter_ahead "$slot" "$since")"
+	if [[ -n "$ahead" ]]; then
+		printf 'queued behind slot %s' "$ahead"
+		return 0
+	fi
+	used=$(($(fleet_used_mb) + $(fleet_claims_mb "$slot")))
+	((used + need > budget)) &&
+		printf 'fleet holds %sM of %sM; this slot needs %sM free' "$used" "$budget" "$need"
+	return 0
+}
+
+# Blocks until slot $1 may register a runner for a VM of $2 MiB, then claims
+# that memory. Returns 1 if the slot is drained meanwhile. A stop signal
+# exits through on_stop, and cleanup removes the wait file. Decisions run
+# under one fleet-wide lock (fd 8, held only for the check) so two slots
+# cannot both read the same free memory and both start.
+fleet_admit() {
+	local slot="$1" need="$2" budget wf since reason last="" lock="$RUN_DIR/.fleet-admit.lock"
+	budget="$(fleet_live_budget_mb)"
+	[[ -n "$budget" ]] || return 0
+	wf="$(wait_flag "$slot")"
+	since=$(date +%s)
+	printf '%s\n' "$since" >"$wf"
+	while :; do
+		if [[ -e "$(drain_flag "$slot")" ]]; then
+			rm -f "$wf"
+			return 1
+		fi
+		exec 8>"$lock"
+		flock 8
+		reason="$(fleet_block_reason "$slot" "$need" "$since" "$budget")"
+		if [[ -z "$reason" ]]; then
+			printf '%s %s\n' "$(date +%s)" "$need" >"$(claim_flag "$slot")"
+			rm -f "$wf"
+			exec 8>&-
+			[[ -n "$last" ]] && log "slot $slot: memory available after $(($(date +%s) - since))s; starting"
+			return 0
+		fi
+		exec 8>&-
+		[[ "$reason" != "$last" ]] && log "slot $slot: waiting for memory: $reason"
+		last="$reason"
+		nap 10
+		budget="$(fleet_live_budget_mb)"
+		if [[ -z "$budget" ]]; then
+			rm -f "$wf"
+			return 0
+		fi
+	done
+}
+
+# This process's cgroup v2 path, e.g. /ghavm.slice/gha-vm@1.service.
+own_cgroup() { sed -n 's/^0:://p' /proc/self/cgroup; }
+
+# OOM kills recorded against this process's own cgroup; empty when it is not
+# in one that accounts memory (a supervisor started by hand).
+own_oom_kills() {
+	local cg f
+	cg="$(own_cgroup)"
+	f="$CGROUP_ROOT${cg}/memory.events"
+	[[ -n "$cg" && -r "$f" ]] || return 0
+	awk '$1 == "oom_kill" { print $2; exit }' "$f"
 }
 
 # ------------------------------------------------------------------ auth ----
@@ -830,6 +1130,79 @@ EOF
 	log "host security updates: unattended (auto-reboot: $reboot$when)"
 }
 
+ZRAM_CONF=/etc/systemd/zram-generator.conf
+ZRAM_MARK='# Written by gha-vm.sh; edit HOST_ZRAM/HOST_ZRAM_SIZE in config.env and re-run deps or repair.'
+
+zram_conf_render() {
+	printf '%s\n[zram0]\nzram-size = %s\ncompression-algorithm = zstd\nswap-priority = 100\n' "$ZRAM_MARK" "$HOST_ZRAM_SIZE"
+}
+
+zram_conf_ours() { [[ -r "$ZRAM_CONF" ]] && [[ "$(head -n 1 "$ZRAM_CONF")" == "$ZRAM_MARK" ]]; }
+
+# True when the zram swap differs from what HOST_ZRAM asks for and is ours to
+# change; a zram config someone else wrote is never drift.
+zram0_swapping() { grep -q '^/dev/zram0[[:space:]]' /proc/swaps; }
+
+# zram swap set up by something else (zram-tools, zram-config, a hand-written
+# generator config) owns the devices; formatting over it would fail or worse.
+zram_foreign() {
+	if [[ -e "$ZRAM_CONF" ]]; then
+		if zram_conf_ours; then return 1; fi
+	else
+		grep -q '^/dev/zram' /proc/swaps
+	fi
+}
+
+# True when the zram swap differs from what HOST_ZRAM asks for and is ours to
+# change; zram someone else set up is never drift.
+zram_drifted() {
+	if [[ "$HOST_ZRAM" != 1 ]]; then
+		zram_conf_ours
+		return
+	fi
+	zram_foreign && return 1
+	[[ "$(cat "$ZRAM_CONF" 2>/dev/null)" != "$(zram_conf_render)" ]] || ! zram0_swapping
+}
+
+# Compressed swap in RAM. The fleet's MemoryHigh only slows an overgrown fleet
+# down when there is swap to push cold pages to; without it the kernel can
+# only drop page cache and then has to OOM-kill.
+setup_zram() {
+	if [[ "$HOST_ZRAM" != 1 ]]; then
+		if zram_conf_ours; then
+			rm -f "$ZRAM_CONF"
+			log "HOST_ZRAM=0: removed $ZRAM_CONF; the zram swap goes away at the next reboot"
+		fi
+		return 0
+	fi
+	if zram_foreign; then
+		log "WARN: zram swap is managed outside gha-vm.sh here; leaving it as is (set HOST_ZRAM=0 to silence this)"
+		return 0
+	fi
+	dpkg-query -W -f='${Status}' systemd-zram-generator 2>/dev/null | grep -q 'install ok installed' ||
+		apt_get install -y --no-install-recommends systemd-zram-generator
+	local want changed=0
+	want="$(zram_conf_render)"
+	if [[ "$(cat "$ZRAM_CONF" 2>/dev/null)" != "$want" ]]; then
+		printf '%s\n' "$want" >"$ZRAM_CONF"
+		changed=1
+	fi
+	systemctl daemon-reload
+	# systemd-zram-setup@zram0 only formats the device; the generated swap
+	# unit is what turns it on.
+	if ((changed)) && zram0_swapping; then
+		# Resizing means swapping the device off first, which needs room for
+		# everything on it; a busy host keeps the old size until reboot.
+		if ! { systemctl stop dev-zram0.swap && systemctl restart systemd-zram-setup@zram0.service; }; then
+			log "WARN: could not resize zram swap now; the new size applies at the next reboot"
+		fi
+	fi
+	systemctl start dev-zram0.swap ||
+		die "could not turn on zram swap (dev-zram0.swap); see: journalctl -u systemd-zram-setup@zram0 -u dev-zram0.swap"
+	zram0_swapping || die "dev-zram0.swap started but /dev/zram0 is not in /proc/swaps"
+	log "host swap: zram0 (size: $HOST_ZRAM_SIZE MiB, zstd)"
+}
+
 cmd_deps() {
 	[[ $EUID -eq 0 ]] || die "deps must run as root"
 
@@ -862,6 +1235,7 @@ cmd_deps() {
 
 	setup_timesync
 	setup_unattended
+	setup_zram
 	systemctl enable nftables.service >/dev/null 2>&1 ||
 		log "WARN: could not enable nftables.service; isolation rules will not survive a reboot"
 
@@ -1984,6 +2358,22 @@ guest_network_config() {
 
 drain_flag() { printf '%s/.slot-%s.drain' "$RUN_DIR" "$1"; }
 
+# Runner.Listener prints this when GitHub hands it a job. Until then the VM is
+# an idle registered runner, and stopping it loses no work.
+JOB_MARKER=': Running job: '
+vm_has_job() { grep -qF "$JOB_MARKER" "$1/console.log" 2>/dev/null; }
+
+# A run directory outlives a SIGKILLed supervisor and its VM; without a live
+# supervisor it is leftover disk, not a job.
+slot_has_job() {
+	local d
+	slot_is_live "$1" || return 1
+	for d in "$RUN_DIR/${NAME_PREFIX}-$1-"*/; do
+		[[ -d "$d" ]] && vm_has_job "${d%/}" && return 0
+	done
+	return 1
+}
+
 cmd_run() {
 	need "$QEMU_BIN"
 	need cloud-localds
@@ -1991,12 +2381,30 @@ cmd_run() {
 	need flock
 	local slot="${1:-1}"
 	[[ "$slot" =~ ^[0-9]+$ ]] || die "slot must be a number"
+	apply_slot_class "$slot"
+
+	# Checked before taking the lock so a misfit slot fails with the reason
+	# instead of queueing forever behind a budget it can never fit.
+	local need budget
+	need="$(mem_to_mb "$VM_MEM")"
+	budget="$(fleet_live_budget_mb)"
+	if [[ -n "$budget" ]]; then
+		[[ -r "$CGROUP_ROOT/cgroup.controllers" ]] ||
+			die "slot $slot: FLEET_MEM needs cgroup v2 at $CGROUP_ROOT (or set FLEET_MEM=off)"
+		((need <= budget)) ||
+			die "slot $slot: its VM size $VM_MEM exceeds the fleet memory budget of ${budget}M, so it could never start; lower VM_MEM_$slot/VM_MEM or raise FLEET_MEM"
+		[[ "$(own_cgroup)" == /ghavm.slice/* ]] ||
+			log "slot $slot: WARN not running in ghavm.slice, so the kernel does not enforce the fleet memory ceiling; re-run: $SELF install, then: $SELF restart all"
+	fi
 
 	install -d -m 0750 "$RUN_DIR"
 
 	# Guards against a hand-started supervisor racing the systemd one.
 	exec 9>"$RUN_DIR/.slot-$slot.lock"
 	flock -n 9 || die "slot $slot already has a supervisor running"
+	# Left by a supervisor that was SIGKILLed: a stale wait file would put this
+	# slot at the head of the admission queue while it is still starting up.
+	rm -f "$(wait_flag "$slot")" "$(claim_flag "$slot")"
 
 	# Missing golden is a wait, not a failure: the first image build may be in
 	# progress, and a restart loop would only add noise to its log.
@@ -2041,19 +2449,34 @@ cmd_run() {
 				log "slot $slot: WARN could not deregister $name; the startup reap will retry"
 		fi
 		[[ -n "$dir" ]] && rm -rf "$dir"
+		rm -f "$(wait_flag "$slot")" "$(claim_flag "$slot")"
 		return 0
 	}
 	trap cleanup EXIT
 
-	# A stop request lets a running job finish, up to STOP_GRACE_SEC. A VM
-	# that has not reported ready yet has no job to lose and is stopped at once.
+	# A stop request lets a running job finish, up to STOP_GRACE_SEC. A VM with
+	# no job is stopped at once. Its runner is deregistered first: GitHub
+	# refuses to delete a busy runner, so a job handed out just before the stop
+	# makes the delete fail, and shows on the console within seconds.
 	on_stop() {
 		trap '' INT TERM
 		stopping=1
-		if [[ -n "$vmpid" ]] && kill -0 "$vmpid" 2>/dev/null && ((ready == 1)); then
-			log "slot $slot: stop requested; letting $name finish (up to ${STOP_GRACE_SEC}s)"
-			wait_pid "$vmpid" "$STOP_GRACE_SEC" ||
-				log "slot $slot: $name still running after ${STOP_GRACE_SEC}s; killing it"
+		local busy=0
+		if [[ -n "$vmpid" ]] && kill -0 "$vmpid" 2>/dev/null; then
+			if vm_has_job "$dir"; then
+				busy=1
+			elif grep -qF "$READY_MARKER" "$dir/console.log" 2>/dev/null &&
+				! API_MAXTIME=5 API_RETRY=0 reap_one "$name"; then
+				nap 10
+				vm_has_job "$dir" && busy=1
+			fi
+			if ((busy)); then
+				log "slot $slot: stop requested; letting $name finish its job (up to ${STOP_GRACE_SEC}s)"
+				wait_pid "$vmpid" "$STOP_GRACE_SEC" ||
+					log "slot $slot: $name still running after ${STOP_GRACE_SEC}s; killing it"
+			else
+				log "slot $slot: stop requested; $name has no job, stopping it"
+			fi
 		else
 			log "slot $slot: stop requested"
 		fi
@@ -2099,6 +2522,10 @@ cmd_run() {
 			continue
 		fi
 
+		# A runner is registered only once this VM fits in the fleet budget:
+		# an idle runner could take a job the host has no memory left for.
+		fleet_admit "$slot" "$need" || continue
+
 		name="${NAME_PREFIX}-${slot}-$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')"
 		dir="$RUN_DIR/$name"
 		install -d -m 0700 "$dir"
@@ -2108,6 +2535,7 @@ cmd_run() {
 		local jit
 		if ! runner_group_id || ! jit="$(mint_jit "$name")"; then
 			mint_fails=$((mint_fails + 1))
+			rm -f "$(claim_flag "$slot")"
 			rm -rf "$dir"
 			dir=""
 			name=""
@@ -2150,8 +2578,9 @@ cmd_run() {
 		tail -n +1 -F "$dir/console.log" >&2 9>&- &
 		tailpid=$!
 
-		local started
+		local started oom_before
 		started=$(date +%s)
+		oom_before="$(own_oom_kills)"
 		build_qemu_args "$name" "$dir" "$code" "$cpu"
 		"$QEMU_BIN" "${QEMU_ARGS[@]}" 9>&- &
 		vmpid=$!
@@ -2182,9 +2611,18 @@ cmd_run() {
 			wait_pid "$vmpid" 60 || kill -KILL "$vmpid" 2>/dev/null || true
 		fi
 
-		local rc=0
+		local rc=0 oom_after
 		wait "$vmpid" || rc=$?
 		vmpid=""
+		rm -f "$(claim_flag "$slot")"
+		# The kernel killed the VM: it outgrew its unit's MemoryMax, or the
+		# fleet outgrew ghavm.slice's. The job is lost either way; the runner
+		# is deregistered like any other VM that was killed.
+		oom_after="$(own_oom_kills)"
+		if [[ -z "$reason" && -n "$oom_before" && -n "$oom_after" ]] && ((oom_after > oom_before)); then
+			reason="oom-killed"
+			log "slot $slot: ERROR $name was killed for lack of memory (slot limit $VM_MEM + 2G overhead, or the fleet ceiling); see: $SELF fleet"
+		fi
 		kill -TERM "$tailpid" 2>/dev/null || true
 		wait "$tailpid" 2>/dev/null || true
 		tailpid=""
@@ -2255,29 +2693,44 @@ cmd_undrain() {
 	done < <(slot_list "${1:-all}")
 }
 
-# Drain, wait for the current job to finish, restart the unit, undrain. Used
-# after `install` rewrote the unit, or after this script was updated, without
-# losing a running job.
+# Drain every slot, restart each once its VM has no job, undrain. Used after
+# `install` rewrote the unit, or after this script was updated, without losing
+# a running job. Idle slots restart at once; busy ones as their job finishes,
+# up to STOP_GRACE_SEC.
 cmd_restart() {
 	[[ $EUID -eq 0 ]] || die "restart must run as root"
-	local s w
-	while read -r s; do
-		[[ -n "$s" ]] || continue
-		: >"$(drain_flag "$s")"
-		w=0
-		while [[ -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d -name "${NAME_PREFIX}-${s}-*" 2>/dev/null)" ]]; do
-			if ((w >= STOP_GRACE_SEC)); then
+	local s w=0 failed=0 pending=() left
+	mapfile -t pending < <(slot_list "${1:-all}")
+	install -d -m 0750 "$RUN_DIR"
+	for s in "${pending[@]}"; do
+		[[ -n "$s" ]] && : >"$(drain_flag "$s")"
+	done
+	while ((${#pending[@]})); do
+		left=()
+		for s in "${pending[@]}"; do
+			[[ -n "$s" ]] || continue
+			if slot_has_job "$s"; then
+				if ((w < STOP_GRACE_SEC)); then
+					((w % 60 == 0)) && log "slot $s: waiting for the current job to finish (${w}s)"
+					left+=("$s")
+					continue
+				fi
 				log "slot $s: job still running after ${STOP_GRACE_SEC}s; restarting anyway"
-				break
 			fi
-			((w % 60 == 0)) && log "slot $s: waiting for the current job to finish (${w}s)"
-			sleep 5
-			w=$((w + 5))
+			rm -f "$(drain_flag "$s")"
+			if systemctl restart "gha-vm@${s}.service"; then
+				log "slot $s: restarted"
+			else
+				log "slot $s: ERROR could not restart gha-vm@${s}.service"
+				failed=$((failed + 1))
+			fi
 		done
-		rm -f "$(drain_flag "$s")"
-		systemctl restart "gha-vm@${s}.service" || die "could not restart gha-vm@${s}.service"
-		log "slot $s: restarted"
-	done < <(slot_list "${1:-all}")
+		pending=("${left[@]}")
+		((${#pending[@]})) || break
+		sleep 5
+		w=$((w + 5))
+	done
+	((failed == 0)) || die "$failed slot(s) failed to restart; see: journalctl -u 'gha-vm@*'"
 }
 
 # ------------------------------------------------------------- reap/clean ----
@@ -2341,15 +2794,39 @@ cmd_capacity() {
 	for k in HOST_RESERVE_GB CPU_OVERCOMMIT MAX_SLOTS; do
 		[[ "${!k}" =~ ^[0-9]+$ ]] || die "$k must be a whole number (got '${!k}')"
 	done
-	for k in VM_CPUS DISK_PER_SLOT_GB; do
+	for k in VM_CPUS DISK_PER_SLOT_GB MEM_OVERCOMMIT_PCT; do
 		[[ "${!k}" =~ ^[1-9][0-9]*$ ]] || die "$k must be a positive integer (got '${!k}')"
 	done
+	validate_slot_classes
+	[[ "$FLEET_MEM" =~ ^(auto|off|[0-9]+[MGmg])$ ]] || die "FLEET_MEM must be auto, off, or a size like 24G (got '$FLEET_MEM')"
 	reserve_mb=$((HOST_RESERVE_GB * 1024))
 
-	slots_mem=$(((ram_mb - reserve_mb) / per_mb))
-	slots_cpu=$((cores * CPU_OVERCOMMIT / VM_CPUS))
+	# Slots are counted in order, each at its own size, until the next one
+	# would not fit: the memory pool is the fleet budget stretched by
+	# MEM_OVERCOMMIT_PCT, since slots rarely all peak at once and admission
+	# holds back the ones that would not fit right now. A slot bigger than
+	# the budget itself could never be admitted and ends the count.
+	local budget pool cpu_pool sum_mem=0 sum_cpu=0 m c n
+	budget="$(fleet_budget_mb)"
+	[[ -n "$budget" ]] || budget=$((ram_mb - reserve_mb))
+	((budget < 0)) && budget=0
+	pool=$((budget * MEM_OVERCOMMIT_PCT / 100))
+	cpu_pool=$((cores * CPU_OVERCOMMIT))
+	slots_mem=0
+	slots_cpu=0
+	for ((n = 1; n <= 4096; n++)); do
+		m="$(slot_mem_mb "$n")"
+		((m <= budget && sum_mem + m <= pool)) || break
+		sum_mem=$((sum_mem + m))
+		slots_mem=$n
+	done
+	for ((n = 1; n <= 4096; n++)); do
+		c="$(slot_cpus "$n")"
+		((sum_cpu + c <= cpu_pool)) || break
+		sum_cpu=$((sum_cpu + c))
+		slots_cpu=$n
+	done
 	slots_disk=$((avail / DISK_PER_SLOT_GB))
-	((slots_mem < 0)) && slots_mem=0
 
 	rec=$slots_mem
 	bound=memory
@@ -2371,8 +2848,19 @@ cmd_capacity() {
 	printf 'host           %s cores, %sG RAM, %sG free under %s%s\n' \
 		"$cores" "$((ram_mb / 1024))" "$avail" "$STATE_DIR" "$virt"
 	printf 'per slot       %s vCPU, %s RAM, %sG disk budget\n' "$VM_CPUS" "$VM_MEM" "$DISK_PER_SLOT_GB"
-	printf 'memory limit   %s slots  (reserving %sG for the host%s)\n' \
-		"$slots_mem" "$HOST_RESERVE_GB" "$tuned"
+	while read -r n; do
+		[[ -n "$n" ]] || continue
+		k="RUNNER_LABELS_EXTRA_$n"
+		printf 'slot %-9s %s vCPU, %s RAM%s\n' "$n" "$(slot_cpus "$n")" "$(slot_mem "$n")" "${!k:+, extra labels ${!k}}"
+	done < <(slot_class_slots)
+	if [[ "$FLEET_MEM" == off ]]; then
+		printf 'fleet memory   off  (no shared ceiling; each slot is capped at its own size)\n'
+	else
+		printf 'fleet memory   %sM shared ceiling  (FLEET_MEM=%s; a slot starts only when its size is free)\n' \
+			"$budget" "$FLEET_MEM"
+	fi
+	printf 'memory limit   %s slots  (reserving %sG for the host%s; slot sizes up to %s%% of the budget)\n' \
+		"$slots_mem" "$HOST_RESERVE_GB" "$tuned" "$MEM_OVERCOMMIT_PCT"
 	printf 'cpu limit      %s slots  (%sx overcommit)\n' "$slots_cpu" "$CPU_OVERCOMMIT"
 	printf 'disk limit     %s slots\n' "$slots_disk"
 
@@ -2384,8 +2872,9 @@ cmd_capacity() {
 
 	printf '\nrecommended    %s slots  (%s-bound)  ->  %s install %s\n' \
 		"$rec" "$bound" "$SELF" "$rec"
-	printf '\nBalloon free-page-reporting returns idle guest memory to the host, so the\n'
-	printf 'memory limit above is a worst case with every slot running a heavy job.\n'
+	printf '\nBalloon free-page-reporting returns idle guest memory to the host. With\n'
+	printf 'MEM_OVERCOMMIT_PCT above 100, slots beyond what the budget holds at full\n'
+	printf 'size wait for memory instead of taking jobs; see: %s fleet\n' "$SELF"
 }
 
 # "Which machine am I on, and what sizing did that pick?" -- the one command to
@@ -2416,6 +2905,13 @@ cmd_profile() {
 	printf '\neffective sizing\n'
 	printf '  VM_CPUS            %s\n' "$VM_CPUS"
 	printf '  VM_MEM             %s\n' "$VM_MEM"
+	printf '  FLEET_MEM          %s\n' "$FLEET_MEM"
+	printf '  MEM_OVERCOMMIT_PCT %s\n' "$MEM_OVERCOMMIT_PCT"
+	printf '  HOST_ZRAM          %s\n' "$HOST_ZRAM"
+	local k
+	while read -r k; do
+		[[ -n "$k" ]] && printf '  %-18s %s\n' "$k" "${!k}"
+	done < <(slot_class_keys | sort -V)
 	printf '  VM_DISK            %s\n' "$VM_DISK"
 	printf '  HOST_RESERVE_GB    %s%s\n' "$HOST_RESERVE_GB" "$tuned"
 	printf '  DISK_PER_SLOT_GB   %s\n' "$DISK_PER_SLOT_GB"
@@ -2488,6 +2984,12 @@ cmd_repair() {
 		[[ "$HOST_UNATTENDED" != 1 && -e /etc/apt/apt.conf.d/52gha-vm ]]; then
 		log "repair: applying the host update policy"
 		setup_unattended
+		fixed=1
+	fi
+
+	if zram_drifted; then
+		log "repair: applying the host zram swap policy"
+		setup_zram
 		fixed=1
 	fi
 
@@ -2743,14 +3245,34 @@ cmd_doctor() {
 			ok=1
 		else echo OK; fi
 	else
-		if ! resp="$(api GET "/orgs/$GITHUB_ORG/repos?type=public&per_page=1" 2>/dev/null)"; then
-			echo "UNKNOWN: could not list $GITHUB_ORG's public repos"
-			ok=1
-		elif [[ "$(jq 'length' <<<"$resp")" -gt 0 ]]; then
-			echo "DANGER: org has public repos; restrict the runner group to private repos"
+		# The runner group gates public-repo access on its own, so ask the group
+		# first; whether the org merely owns public repos is the weaker signal and
+		# only answers when the group cannot be read.
+		local gid="" allows=""
+		if runner_group_id 2>/dev/null; then gid="$_RG_ID"; fi
+		if [[ -n "$gid" ]] && resp="$(api GET "/orgs/$GITHUB_ORG/actions/runner-groups/$gid" 2>/dev/null)"; then
+			# Not `// empty`: jq's alternative operator treats false as absent,
+			# which would turn the safe answer into an unknown one.
+			allows="$(jq -r '.allows_public_repositories' <<<"$resp" 2>/dev/null)" || allows=""
+		fi
+		case "$allows" in
+		true)
+			echo "DANGER: runner group $gid allows public repositories; fork PRs execute arbitrary code here"
 			fork_approval_advice
 			ok=1
-		else echo OK; fi
+			;;
+		false) echo "OK (runner group $gid rejects public repos)" ;;
+		*)
+			if ! resp="$(api GET "/orgs/$GITHUB_ORG/repos?type=public&per_page=1" 2>/dev/null)"; then
+				echo "UNKNOWN: could not read runner group ${gid:-?} or list $GITHUB_ORG's public repos"
+				ok=1
+			elif [[ "$(jq 'length' <<<"$resp")" -gt 0 ]]; then
+				echo "DANGER: org has public repos and runner group ${gid:-?} is unreadable; restrict the group to private repos"
+				fork_approval_advice
+				ok=1
+			else echo OK; fi
+			;;
+		esac
 	fi
 
 	printf 'host isolation: '
@@ -2769,12 +3291,118 @@ cmd_doctor() {
 		echo "loaded but not included from $NFT_MAIN; netcheck reloads it at slot start (re-run: $SELF net)"
 	else echo OK; fi
 
+	printf 'fleet memory: '
+	local budget live="" enabled n big=""
+	budget="$(fleet_budget_mb)"
+	enabled="$(enabled_slots | tail -n 1)"
+	if [[ -z "$budget" ]]; then
+		echo "off (FLEET_MEM=off; each slot is capped at its own size only)"
+	elif [[ ! -r "$CGROUP_ROOT/cgroup.controllers" ]]; then
+		echo "FAIL: FLEET_MEM needs cgroup v2 at $CGROUP_ROOT"
+		ok=1
+	else
+		for ((n = 1; n <= ${enabled:-0}; n++)); do
+			(($(slot_mem_mb "$n") <= budget)) || big+=" $n"
+		done
+		[[ -r "$CGROUP_ROOT/ghavm.slice/memory.high" ]] && live="$(<"$CGROUP_ROOT/ghavm.slice/memory.high")"
+		if [[ -n "$big" ]]; then
+			echo "FAIL: slot(s)$big are bigger than the ${budget}M budget and can never start"
+			ok=1
+		elif [[ ! -e "$FLEET_SLICE" ]]; then
+			echo "ghavm.slice not installed (re-run: $SELF install, then: $SELF restart all)"
+			ok=1
+		elif [[ "$live" =~ ^[0-9]+$ ]] && ! fleet_budget_close "$((live / 1048576))" "$budget"; then
+			echo "ghavm.slice enforces $((live / 1048576))M, config says ${budget}M (re-run: $SELF install)"
+			ok=1
+		elif [[ -n "$live" && ! "$live" =~ ^[0-9]+$ ]]; then
+			echo "ghavm.slice has no memory limit, config says ${budget}M (re-run: $SELF install)"
+			ok=1
+		elif (($(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024 < budget + $(fleet_slack_mb "$budget"))); then
+			echo "WARN: ${budget}M budget plus $(fleet_slack_mb "$budget")M QEMU margin exceeds RAM; the host may OOM before the slice does"
+		else
+			echo "OK (${budget}M shared, $(fleet_used_mb)M in use; see: $SELF fleet)"
+		fi
+	fi
+
+	printf 'swap: '
+	local swap_kb
+	swap_kb="$(awk 'NR > 1 { s += $3 } END { print s + 0 }' /proc/swaps)"
+	if ((swap_kb > 0)); then
+		echo "OK ($((swap_kb / 1024))M$(grep -q '^/dev/zram' /proc/swaps && echo ', zram'))"
+	elif [[ -n "$budget" ]]; then
+		echo "WARN: none; a fleet past its budget gets OOM-killed instead of slowed down (HOST_ZRAM=1, then: $SELF repair)"
+	else
+		echo "none"
+	fi
+
 	printf 'slot count: '
 	local running
 	running=$(systemctl list-units --no-legend --state=active 'gha-vm@*.service' 2>/dev/null | wc -l)
 	echo "$running active (see: $SELF capacity)"
 
 	return "$ok"
+}
+
+# The fleet's shared memory: budget, what the slot units hold, and per slot
+# its size, use and whether it is running a VM or waiting for room.
+cmd_fleet() {
+	local budget src r sw claims n f k st since reason vm
+	if [[ "$FLEET_MEM" == off ]]; then
+		printf 'budget     off  (FLEET_MEM=off: no shared ceiling, no admission wait)\n'
+	else
+		budget="$(fleet_live_budget_mb)"
+		src="config FLEET_MEM=$FLEET_MEM; ghavm.slice not active"
+		[[ -r "$CGROUP_ROOT/ghavm.slice/memory.high" ]] && src="ghavm.slice MemoryHigh"
+		printf 'budget     %sM  (%s)\n' "$budget" "$src"
+	fi
+	read -r r sw <<<"$(fleet_mem_usage)"
+	claims="$(fleet_claims_mb)"
+	printf 'in use     %sM  (%sM resident + %sM swapped; page cache not counted)\n' "$((r + sw))" "$r" "$sw"
+	((claims > 0)) && printf 'claimed    %sM  (VMs started in the last %ss, not yet at full size)\n' "$claims" "$FLEET_CLAIM_SEC"
+	[[ -n "${budget:-}" ]] && printf 'free       %sM\n' "$((budget - r - sw - claims))"
+
+	local slots=()
+	mapfile -t slots < <(
+		{
+			for f in "$RUN_DIR"/.slot-*.lock "$RUN_DIR"/.slot-*.wait; do
+				[[ -e "$f" ]] || continue
+				k="${f##*/.slot-}"
+				printf '%s\n' "${k%.*}"
+			done
+			for f in "$CGROUP_ROOT"/*/gha-vm@*.service; do
+				[[ -d "$f" ]] || continue
+				k="${f##*/gha-vm@}"
+				printf '%s\n' "${k%.service}"
+			done
+		} | grep -E '^[0-9]+$' | sort -nu
+	)
+	((${#slots[@]})) || return 0
+	printf '\n%-5s %-8s %-8s %s\n' slot size in-use state
+	for n in "${slots[@]}"; do
+		vm=""
+		for f in "$RUN_DIR/$NAME_PREFIX-$n-"*/; do
+			[[ -d "$f" ]] && vm="$(basename "$f")"
+		done
+		if [[ -e "$(drain_flag "$n")" ]]; then
+			st="drained"
+		elif ! slot_is_live "$n"; then
+			st="stopped"
+		elif [[ -r "$(wait_flag "$n")" ]]; then
+			since="$(<"$(wait_flag "$n")")"
+			[[ "$since" =~ ^[0-9]+$ ]] || since=$(date +%s)
+			reason=""
+			[[ -n "${budget:-}" ]] &&
+				reason="$(fleet_block_reason "$n" "$(slot_mem_mb "$n")" "$since" "$budget")"
+			st="waiting $(($(date +%s) - since))s${reason:+: $reason}"
+		elif [[ -n "$vm" ]] && vm_has_job "$RUN_DIR/$vm"; then
+			st="busy $vm"
+		elif [[ -n "$vm" ]]; then
+			st="idle $vm"
+		else
+			st="starting"
+		fi
+		printf '%-5s %-8s %-8s %s\n' "$n" "$(slot_mem_mb "$n")M" "$(fleet_used_mb "$n")M" "$st"
+	done
 }
 
 cmd_status() {
@@ -2786,6 +3414,9 @@ cmd_status() {
 		s="${s##*/.slot-}"
 		echo "slot ${s%.drain}: DRAINED (undrain with: $SELF undrain ${s%.drain})"
 	done
+	echo
+	echo "== fleet memory =="
+	cmd_fleet
 	echo
 	echo "== live VMs =="
 	local d found=0
@@ -2859,8 +3490,13 @@ LogRateLimitIntervalSec=30
 LogRateLimitBurst=20000
 UMask=0077
 
-# One runaway slot must not take the host down with it.
+# One runaway slot must not take the host down with it; slots with their own
+# VM_MEM_<n> get their own limit from a drop-in. The slice holds the fleet's
+# shared ceiling, and a VM the kernel kills for memory is the supervisor's
+# to report, not a reason to stop the unit.
+Slice=ghavm.slice
 MemoryMax=$((mem_mb + 2048))M
+OOMPolicy=continue
 CPUWeight=50
 IOWeight=50
 
@@ -2924,6 +3560,64 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+
+	slice_render
+	slot_dropins_render
+}
+
+# ghavm.slice: the fleet's shared memory ceiling. MemoryHigh is where the
+# kernel starts reclaiming and swapping inside the slice, so a fleet that
+# outgrows the budget slows down instead of starving the host; MemoryMax, a
+# margin above for QEMU's own overhead, is where it OOM-kills a VM.
+slice_render() {
+	local budget limits=""
+	budget="$(fleet_budget_mb)"
+	if [[ -n "$budget" ]]; then
+		((budget > 0)) || die "FLEET_MEM=auto leaves no memory: RAM is not above HOST_RESERVE_GB=${HOST_RESERVE_GB}G"
+		limits=$'\n'"MemoryHigh=${budget}M"$'\n'"MemoryMax=$((budget + $(fleet_slack_mb "$budget")))M"
+	fi
+	cat >"$FLEET_SLICE" <<EOF
+[Unit]
+Description=GitHub Actions runner VMs
+Before=slices.target
+
+[Slice]
+MemoryAccounting=yes${limits}
+EOF
+}
+
+slot_dropin() { printf '%s/gha-vm@%s.service.d/50-gha-vm-size.conf' "$SYSTEMD_DIR" "$1"; }
+
+# A per-slot MemoryMax for every slot with its own VM_MEM_<n>; drop-ins left
+# from a slot whose override was removed go with it.
+slot_dropins_render() {
+	local n k f want=" "
+	while read -r n; do
+		[[ -n "$n" ]] || continue
+		k="VM_MEM_$n"
+		[[ -n "${!k:-}" ]] || continue
+		want+="$n "
+		f="$(slot_dropin "$n")"
+		install -d -m 0755 "${f%/*}"
+		printf '# Written by gha-vm.sh from VM_MEM_%s.\n[Service]\nMemoryMax=%sM\n' "$n" "$(($(slot_mem_mb "$n") + 2048))" >"$f"
+	done < <(slot_class_slots)
+	for f in "$SYSTEMD_DIR"/gha-vm@*.service.d/50-gha-vm-size.conf; do
+		[[ -e "$f" ]] || continue
+		n="${f##*/gha-vm@}"
+		n="${n%%.service.d/*}"
+		[[ "$want" == *" $n "* ]] && continue
+		rm -f "$f"
+		[[ -n "$(ls -A "${f%/*}")" ]] || rmdir "${f%/*}"
+	done
+}
+
+# Rendered drop-ins, one path per line, for logs and tests.
+slot_dropin_paths() {
+	local f
+	for f in "$SYSTEMD_DIR"/gha-vm@*.service.d/50-gha-vm-size.conf; do
+		[[ -e "$f" ]] && printf '%s\n' "$f"
+	done
+	return 0
 }
 
 # Units and the ruleset, written to wherever GHA_SYSTEMD_DIR and GHA_NFT_CONF
@@ -2932,7 +3626,58 @@ cmd_render() {
 	validate_sizing
 	unit_render
 	net_write
-	log "rendered $UNIT $UPGRADE_UNIT $UPGRADE_TIMER $NFT_CONF"
+	log "rendered $UNIT $FLEET_SLICE $UPGRADE_UNIT $UPGRADE_TIMER $NFT_CONF $(slot_dropin_paths | paste -sd' ' -)"
+}
+
+# Refuses an install whose fleet memory setup could never work: no cgroup v2
+# to enforce it on, or a slot among 1..$1 too big to ever be admitted.
+fleet_check_install() {
+	local budget n m
+	budget="$(fleet_budget_mb)"
+	[[ -n "$budget" ]] || return 0
+	[[ -r "$CGROUP_ROOT/cgroup.controllers" ]] ||
+		die "FLEET_MEM needs the unified cgroup v2 hierarchy at $CGROUP_ROOT; boot with it or set FLEET_MEM=off"
+	((budget > 0)) || die "FLEET_MEM=auto leaves no memory: RAM is not above HOST_RESERVE_GB=${HOST_RESERVE_GB}G"
+	for ((n = 1; n <= $1; n++)); do
+		m="$(slot_mem_mb "$n")"
+		((m <= budget)) || die "slot $n needs ${m}M, more than the fleet memory budget of ${budget}M; it could never start"
+	done
+}
+
+# Slot numbers with an enabled unit, ascending. Read from the wants links:
+# `systemctl list-unit-files` lists only the template, never its instances.
+enabled_slots() {
+	local f n
+	for f in "$SYSTEMD_DIR"/*.wants/gha-vm@*.service; do
+		[[ -e "$f" || -L "$f" ]] || continue
+		n="${f##*/gha-vm@}"
+		n="${n%.service}"
+		if [[ "$n" =~ ^[0-9]+$ ]]; then printf '%s\n' "$n"; fi
+	done | sort -nu
+}
+
+# Whether the slice's live MemoryHigh ($1 MiB) still matches the budget ($2
+# MiB). With FLEET_MEM=auto the budget follows autotune, which moves with
+# what else is resident, so drift within AUTOTUNE_HEADROOM_GB is not stale.
+fleet_budget_close() {
+	local d=$(($1 - $2)) tol=0
+	((d < 0)) && d=$((-d))
+	[[ "$FLEET_MEM" == auto ]] && ((AUTOTUNE_APPLIED)) && tol=$((AUTOTUNE_HEADROOM_GB * 1024))
+	((d <= tol))
+}
+
+# daemon-reload may leave an active slice on its old limits, and an earlier
+# run's --runtime values outrank the unit file until reboot; setting them
+# every time keeps admission, the file and the kernel in agreement.
+fleet_apply_live() {
+	local budget high=infinity max=infinity
+	budget="$(fleet_budget_mb)"
+	if [[ -n "$budget" ]]; then
+		high="${budget}M"
+		max="$((budget + $(fleet_slack_mb "$budget")))M"
+	fi
+	systemctl set-property --runtime ghavm.slice "MemoryHigh=$high" "MemoryMax=$max" ||
+		die "could not apply the fleet memory limits to the running ghavm.slice"
 }
 
 cmd_install() {
@@ -2941,8 +3686,8 @@ cmd_install() {
 	# Without a count an installed fleet keeps its size; only a first install
 	# falls back to two slots.
 	if [[ -z "$count" ]]; then
-		count="$(systemctl list-unit-files 'gha-vm@*.service' --state=enabled --no-legend 2>/dev/null | grep -c '^gha-vm@[0-9]' || :)"
-		((count > 0)) || count=2
+		count="$(enabled_slots | tail -n 1)"
+		[[ -n "$count" ]] || count=2
 	fi
 	[[ "$count" =~ ^[0-9]+$ && "$count" -ge 1 ]] || die "install needs a slot count >= 1"
 
@@ -2952,6 +3697,7 @@ cmd_install() {
 		log "WARN: installing $count slots, above MAX_SLOTS=$MAX_SLOTS from profile '$HOST_PROFILE'"
 		log "WARN: this host was profiled for other work too; check '$SELF capacity'"
 	fi
+	fleet_check_install "$count"
 
 	# The unit must not depend on a git checkout that can move or change under a
 	# running fleet. The example config and profiles ride along so deps and
@@ -2984,6 +3730,7 @@ cmd_install() {
 		[[ -e "$f" ]] && chown "$GHA_USER":"$GHA_USER" "$f"
 	done
 	systemctl daemon-reload
+	fleet_apply_live
 
 	# Rules from before the current sets existed cannot self-heal at slot
 	# start; re-render them once. The file on disk is what boot loads, so it
@@ -2995,16 +3742,17 @@ cmd_install() {
 	fi
 
 	# Shrinking the fleet must actually shrink it.
-	local u i
-	while read -r u; do
-		i="${u##*@}"
-		i="${i%.service}"
-		if [[ "$i" =~ ^[0-9]+$ ]] && ((i > count)); then
+	local i
+	while read -r i; do
+		if ((i > count)); then
 			log "removing surplus slot $i"
 			systemctl disable --now "gha-vm@${i}.service" >/dev/null 2>&1 ||
 				log "WARN: could not disable gha-vm@${i}.service"
 		fi
-	done < <(systemctl list-unit-files --no-legend 'gha-vm@*.service' 2>/dev/null | awk '{print $1}')
+	done < <({
+		enabled_slots
+		slot_list all
+	} | sort -nu)
 
 	local was_active=0
 	for i in $(seq 1 "$count"); do
@@ -3031,7 +3779,16 @@ cmd_uninstall() {
 	done < <(systemctl list-units --no-legend --all 'gha-vm@*.service' 2>/dev/null | awk '{print $1}')
 	systemctl disable --now gha-vm-upgrade.timer >/dev/null 2>&1 ||
 		log "WARN: could not disable gha-vm-upgrade.timer"
-	rm -f "$UNIT" "$UPGRADE_UNIT" "$UPGRADE_TIMER" "$RUN_DIR"/.slot-*.drain
+	rm -f "$UNIT" "$UPGRADE_UNIT" "$UPGRADE_TIMER" "$FLEET_SLICE" \
+		"$RUN_DIR"/.slot-*.drain "$RUN_DIR"/.slot-*.wait "$RUN_DIR"/.slot-*.claim "$RUN_DIR"/.fleet-admit.lock
+	# Runtime limits from fleet_apply_live; they would outlive the slice file.
+	rm -rf /run/systemd/system.control/ghavm.slice.d
+	local f
+	for f in "$SYSTEMD_DIR"/gha-vm@*.service.d/50-gha-vm-size.conf; do
+		[[ -e "$f" ]] || continue
+		rm -f "$f"
+		[[ -n "$(ls -A "${f%/*}")" ]] || rmdir "${f%/*}"
+	done
 	systemctl daemon-reload
 	cmd_clean --force
 	log "units removed; $STATE_DIR, $CONFIG and the nftables rules were left in place"
@@ -3051,7 +3808,7 @@ CONFIG_KEYS=(
 	VM_CPUS VM_MEM VM_DISK VM_CPU NESTED_VIRT
 	MAX_LIFETIME BOOT_TIMEOUT MIN_FREE_GB
 	STOP_GRACE_SEC REAP_ON_STOP REAP_INTERVAL JIT_BACKOFF_MAX CLOCK_SYNC_WAIT
-	HOST_RESERVE_GB CPU_OVERCOMMIT DISK_PER_SLOT_GB
+	HOST_RESERVE_GB CPU_OVERCOMMIT DISK_PER_SLOT_GB FLEET_MEM MEM_OVERCOMMIT_PCT HOST_ZRAM HOST_ZRAM_SIZE
 	RUNNER_VERSION RUNNER_SHA256 RUNNER_LABELS RUNNER_LABELS_APPEND_HOST RUNNER_GROUP_ID RUNNER_GROUP NAME_PREFIX
 	ALLOW_UNVERIFIED_RUNNER AUTO_RUNNER_VERSION UPGRADE_REBUILD SPARSIFY
 	APT_LOCK_WAIT APT_LOCK_TRIES REQUIRE_ISOLATION
@@ -3078,6 +3835,10 @@ cmd_config() {
 		[[ "$k" == GITHUB_PAT && -n "$v" ]] && v="<set>"
 		printf '%s=%s\n' "$k" "$v"
 	done
+	while read -r k; do
+		[[ -n "$k" ]] && printf '%s=%s\n' "$k" "${!k}"
+	done < <(slot_class_keys | sort -V)
+	return 0
 }
 
 # ------------------------------------------------------------------ main ----
@@ -3103,6 +3864,11 @@ main() {
 	profile)
 		load_config_optional
 		cmd_profile
+		;;
+	fleet)
+		load_config_optional
+		validate_sizing
+		cmd_fleet
 		;;
 	config)
 		load_config_optional

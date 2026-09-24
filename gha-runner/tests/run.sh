@@ -40,10 +40,10 @@ inside() {
 	GHA_SYSTEMD_DIR="$out" GHA_NFT_CONF="$out/nftables.conf" "$gha" render 2>/dev/null ||
 		fail "render exited non-zero"
 	local f
-	for f in gha-vm@.service gha-vm-upgrade.service gha-vm-upgrade.timer nftables.conf; do
+	for f in gha-vm@.service ghavm.slice gha-vm@1.service.d/50-gha-vm-size.conf gha-vm-upgrade.service gha-vm-upgrade.timer nftables.conf; do
 		[[ -s "$out/$f" ]] || fail "render produced no $f"
 		if ((update)); then
-			cp "$out/$f" "/tests/expected/$f"
+			install -D -m 0644 "$out/$f" "/tests/expected/$f"
 			pass "updated expected/$f"
 		elif diff -u "/tests/expected/$f" "$out/$f"; then
 			pass "render $f matches expected"
@@ -56,9 +56,9 @@ inside() {
 	# --- the units load in systemd -------------------------------------------
 	local v=/tmp/verify
 	install -d "$v"
-	cp "$out"/gha-vm@.service "$out"/gha-vm-upgrade.service "$out"/gha-vm-upgrade.timer "$v/"
+	cp -r "$out"/gha-vm@.service "$out"/ghavm.slice "$out"/gha-vm@1.service.d "$out"/gha-vm-upgrade.service "$out"/gha-vm-upgrade.timer "$v/"
 	local verify_out
-	verify_out="$(systemd-analyze verify --recursive-errors=no "$v/gha-vm@1.service" "$v/gha-vm-upgrade.service" "$v/gha-vm-upgrade.timer" 2>&1)" ||
+	verify_out="$(systemd-analyze verify --recursive-errors=no "$v/gha-vm@1.service" "$v/ghavm.slice" "$v/gha-vm-upgrade.service" "$v/gha-vm-upgrade.timer" 2>&1)" ||
 		fail "systemd-analyze verify failed:
 $verify_out"
 	if grep -Eiq 'unknown|failed|invalid|ignoring' <<<"$verify_out"; then
@@ -71,6 +71,167 @@ $verify_out"
 	grep -q '^TimeoutStartSec=300$' "$out/gha-vm@.service" || fail "slot unit lacks the start timeout that bounds netcheck"
 	grep -q '^MemoryMax=10240M$' "$out/gha-vm@.service" || fail "MemoryMax is not VM_MEM+2048M"
 	pass "slot unit derives restart, stop and memory limits from config"
+
+	# --- fleet memory ----------------------------------------------------------
+	grep -qx 'Slice=ghavm.slice' "$out/gha-vm@.service" || fail "slot unit does not run in ghavm.slice"
+	grep -qx 'OOMPolicy=continue' "$out/gha-vm@.service" || fail "an OOM-killed VM would stop the slot unit"
+	grep -qx 'MemoryHigh=24576M' "$out/ghavm.slice" || fail "slice MemoryHigh is not FLEET_MEM"
+	grep -qx 'MemoryMax=26624M' "$out/ghavm.slice" || fail "slice MemoryMax is not FLEET_MEM plus the 2G minimum margin"
+	grep -qx 'MemoryMax=18432M' "$out/gha-vm@1.service.d/50-gha-vm-size.conf" || fail "slot 1 drop-in is not VM_MEM_1+2048M"
+	[[ ! -e "$out/gha-vm@2.service.d" ]] || fail "slot 2 has no override but got a drop-in"
+	pass "fleet slice and per-slot drop-in carry the shared and per-slot limits"
+
+	local fl=/tmp/fleet
+	install -d "$fl"
+	fleet_env() { # extra config lines on stdin
+		{
+			grep -Ev '^(FLEET_MEM|VM_MEM_1|RUNNER_LABELS_EXTRA_1)=' /tests/config.test.env
+			cat
+		} >"$fl/cfg.env"
+	}
+	fleet_env <<<'FLEET_MEM=off'
+	GHA_CONFIG=$fl/cfg.env GHA_SYSTEMD_DIR=$fl/off GHA_NFT_CONF=$fl/off/n.conf "$gha" render 2>/dev/null ||
+		fail "render failed with FLEET_MEM=off"
+	grep -qx 'MemoryAccounting=yes' "$fl/off/ghavm.slice" || fail "FLEET_MEM=off lost the slice"
+	! grep -q '^Memory\(High\|Max\)=' "$fl/off/ghavm.slice" || fail "FLEET_MEM=off still limits the slice"
+	pass "FLEET_MEM=off renders a slice without limits"
+
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_3=16'
+	GHA_CONFIG=$fl/cfg.env GHA_SYSTEMD_DIR=$fl/stale GHA_NFT_CONF=$fl/stale/n.conf "$gha" render 2>/dev/null ||
+		fail "render failed with a bare VM_MEM_3"
+	grep -qx 'MemoryMax=18432M' "$fl/stale/gha-vm@3.service.d/50-gha-vm-size.conf" || fail "bare VM_MEM_3=16 was not read as 16G"
+	[[ "$(GHA_CONFIG=$fl/cfg.env "$gha" config | grep '^VM_MEM_3=')" == VM_MEM_3=16 ]] || fail "config listing omits the per-slot key"
+	touch "$fl/stale/gha-vm@3.service.d/90-operator.conf"
+	fleet_env <<<'FLEET_MEM=24G'
+	GHA_CONFIG=$fl/cfg.env GHA_SYSTEMD_DIR=$fl/stale GHA_NFT_CONF=$fl/stale/n.conf "$gha" render 2>/dev/null ||
+		fail "re-render failed after dropping VM_MEM_3"
+	[[ ! -e "$fl/stale/gha-vm@3.service.d/50-gha-vm-size.conf" ]] || fail "drop-in outlived the VM_MEM_3 it came from"
+	[[ -e "$fl/stale/gha-vm@3.service.d/90-operator.conf" ]] || fail "re-render removed a drop-in it did not write"
+	rm "$fl/stale/gha-vm@3.service.d/90-operator.conf"
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_3=16G'
+	GHA_CONFIG=$fl/cfg.env GHA_SYSTEMD_DIR=$fl/stale GHA_NFT_CONF=$fl/stale/n.conf "$gha" render 2>/dev/null
+	fleet_env <<<'FLEET_MEM=24G'
+	GHA_CONFIG=$fl/cfg.env GHA_SYSTEMD_DIR=$fl/stale GHA_NFT_CONF=$fl/stale/n.conf "$gha" render 2>/dev/null
+	[[ ! -e "$fl/stale/gha-vm@3.service.d" ]] || fail "empty drop-in directory left behind"
+	pass "per-slot drop-ins follow VM_MEM_<n>, sparing the operator's own"
+
+	local bad
+	for bad in 'FLEET_MEM=lots' 'FLEET_MEM=0G' 'VM_MEM_1=lots' 'VM_MEM_0=8G' 'VM_CPUS_2=0' 'MEM_OVERCOMMIT_PCT=0' 'HOST_ZRAM=2' 'HOST_ZRAM_SIZE="ram; x"'; do
+		fleet_env <<<"$bad"
+		if GHA_CONFIG=$fl/cfg.env GHA_SYSTEMD_DIR=$fl/bad GHA_NFT_CONF=$fl/bad/n.conf "$gha" render 2>/dev/null; then
+			fail "render accepted $bad"
+		fi
+	done
+	pass "invalid fleet and per-slot settings refused"
+
+	# Slots count at their own sizes: 16G + 8G fills a 24G budget; at 200%
+	# the pool is 48G, which holds 16G + 4 x 8G.
+	local cap
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nCPU_OVERCOMMIT=100\nDISK_PER_SLOT_GB=1'
+	cap="$(GHA_CONFIG=$fl/cfg.env "$gha" capacity)"
+	grep -q '^memory limit   2 slots' <<<"$cap" || fail "capacity did not count 16G + 8G into 24G: $cap"
+	grep -q '^slot 1 ' <<<"$cap" || fail "capacity does not list the slot 1 override"
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nMEM_OVERCOMMIT_PCT=200\nCPU_OVERCOMMIT=100\nDISK_PER_SLOT_GB=1'
+	cap="$(GHA_CONFIG=$fl/cfg.env "$gha" capacity)"
+	grep -q '^memory limit   5 slots' <<<"$cap" || fail "capacity did not fit 16G + 4 x 8G into 200% of 24G: $cap"
+	grep -q '^recommended    [0-9]* slots' <<<"$cap" || fail "capacity lost the recommended line setup.sh parses"
+	fleet_env <<<$'FLEET_MEM=12G\nVM_MEM_1=16G\nMEM_OVERCOMMIT_PCT=400'
+	cap="$(GHA_CONFIG=$fl/cfg.env "$gha" capacity)"
+	grep -q '^memory limit   0 slots' <<<"$cap" || fail "capacity counted a slot bigger than the budget: $cap"
+	pass "capacity sums per-slot sizes against the overcommitted budget"
+
+	# Fleet accounting from a fixture cgroup tree: page cache is not load,
+	# swap is; a live earlier waiter goes first, a dead one does not; a VM
+	# admitted moments ago still counts at its full size.
+	local cg=$fl/cg run=$fl/run now
+	now=$(date +%s)
+	install -d "$cg/ghavm.slice/gha-vm@1.service" "$cg/ghavm.slice/gha-vm@2.service" "$run/gha-test-1-abcd" "$run/gha-test-2-ef01"
+	printf 'GHA-VM: runner starting\n2026-01-01 00:00:00Z: Running job: build\n' >"$run/gha-test-1-abcd/console.log"
+	printf 'GHA-VM: runner starting\n2026-01-01 00:00:00Z: Listening for Jobs\n' >"$run/gha-test-2-ef01/console.log"
+	: >"$cg/cgroup.controllers"
+	echo $((24576 * 1048576)) >"$cg/ghavm.slice/memory.high"
+	echo $((6144 * 1048576)) >"$cg/ghavm.slice/gha-vm@1.service/memory.current"
+	printf 'anon 1\nfile %s\nshmem %s\n' $((2048 * 1048576)) $((1024 * 1048576)) >"$cg/ghavm.slice/gha-vm@1.service/memory.stat"
+	echo $((512 * 1048576)) >"$cg/ghavm.slice/gha-vm@1.service/memory.swap.current"
+	echo $((3072 * 1048576)) >"$cg/ghavm.slice/gha-vm@2.service/memory.current"
+	printf 'file 0\nshmem 0\n' >"$cg/ghavm.slice/gha-vm@2.service/memory.stat"
+	local l
+	for l in 1 2 3 5; do : >"$run/.slot-$l.lock"; done
+	local holders=()
+	for l in 1 2 3 5; do
+		flock "$run/.slot-$l.lock" sleep 120 &
+		holders+=($!)
+	done
+	sleep 1
+	echo $((now - 30)) >"$run/.slot-4.wait"
+	echo $((now - 20)) >"$run/.slot-3.wait"
+	echo $((now - 10)) >"$run/.slot-5.wait"
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nRUN_DIR='"$run"
+	local fo
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -q '^budget     24576M  (ghavm.slice MemoryHigh)' <<<"$fo" || fail "fleet budget not read from the slice: $fo"
+	grep -q '^in use     8704M  (8192M resident + 512M swapped' <<<"$fo" || fail "fleet use should drop page cache, keep shmem and swap: $fo"
+	grep -Eq '^1 +16384M +5632M +busy gha-test-1-abcd$' <<<"$fo" || fail "slot 1 has a job and should read busy: $fo"
+	grep -Eq '^2 +16384M +3072M +idle gha-test-2-ef01$' <<<"$fo" || fail "slot 2 is registered with no job and should read idle: $fo"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s$' <<<"$fo" || fail "slot 3 fits beside 8704M in use and should be clear to start: $fo"
+	echo "$now 16384" >"$run/.slot-2.claim"
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -q '^claimed    13312M' <<<"$fo" || fail "slot 2 claim should count 16384M - 3072M in use: $fo"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: fleet holds 22016M of 24576M; this slot needs 8192M free$' <<<"$fo" ||
+		fail "slot 3 should wait on memory, ahead of the dead slot 4 waiter: $fo"
+	grep -Eq '^5 +8192M +0M +waiting 1[0-9]s: queued behind slot 3$' <<<"$fo" || fail "slot 5 should queue behind slot 3: $fo"
+	echo "$((now - 600)) 16384" >"$run/.slot-2.claim"
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s$' <<<"$fo" || fail "an expired claim still blocks slot 3: $fo"
+	fleet_env <<<'FLEET_MEM=off'
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero with FLEET_MEM=off"
+	grep -q '^budget     off' <<<"$fo" || fail "FLEET_MEM=off not reported: $fo"
+	kill "${holders[@]}"
+	wait "${holders[@]}" || :
+	pass "fleet accounting, claims and FIFO admission order"
+
+	# restart: an idle runner is not a running job. Slots 2 (idle) and 3 (a
+	# job's run dir left by a killed supervisor) restart at once, slot 1 once
+	# its job finishes, and a failed restart of slot 4 is reported without
+	# leaving any slot drained.
+	local rs=$fl/restart rrun=$fl/restart/run
+	install -d "$rs/bin" "$rrun/gha-test-1-aaaa" "$rrun/gha-test-2-bbbb" "$rrun/gha-test-3-cccc"
+	printf 'GHA-VM: runner starting\n2026-01-01 00:00:00Z: Running job: build\n' >"$rrun/gha-test-1-aaaa/console.log"
+	printf 'GHA-VM: runner starting\n2026-01-01 00:00:00Z: Running job: build\n' >"$rrun/gha-test-3-cccc/console.log"
+	: >"$rrun/.slot-1.lock"
+	flock "$rrun/.slot-1.lock" sleep 60 &
+	local sup1=$!
+	sleep 1
+	printf 'GHA-VM: runner starting\n2026-01-01 00:00:00Z: Listening for Jobs\n' >"$rrun/gha-test-2-bbbb/console.log"
+	cat >"$rs/bin/systemctl" <<SH
+#!/bin/bash
+case "\$1" in
+list-units) printf 'gha-vm@%s.service loaded active running x\\n' 1 2 3 4 ;;
+restart)
+	echo "\$2" >>"$rs/log"
+	[[ "\$2" != gha-vm@4.service ]]
+	;;
+esac
+SH
+	chmod +x "$rs/bin/systemctl"
+	fleet_env <<<"RUN_DIR=$rrun"
+	(sleep 3 && rm -rf "$rrun/gha-test-1-aaaa") &
+	local finisher=$! rout rrc=0 t0
+	t0=$(date +%s)
+	rout="$(PATH="$rs/bin:$PATH" GHA_CONFIG=$fl/cfg.env "$gha" restart all 2>&1)" || rrc=$?
+	wait "$finisher"
+	kill "$sup1"
+	wait "$sup1" || :
+	((rrc != 0)) || fail "restart succeeded although slot 4 failed: $rout"
+	grep -q 'slot 4: ERROR could not restart' <<<"$rout" || fail "restart did not report slot 4: $rout"
+	[[ "$(sed -n 1,3p "$rs/log" | sort | tr '\n' ' ')" == "gha-vm@2.service gha-vm@3.service gha-vm@4.service " ]] ||
+		fail "idle slots did not restart ahead of the busy one: $(cat "$rs/log")"
+	[[ "$(sed -n 4p "$rs/log")" == gha-vm@1.service ]] || fail "busy slot 1 not restarted after its job: $(cat "$rs/log")"
+	grep -q 'slot 1: waiting for the current job to finish (0s)' <<<"$rout" || fail "restart did not wait on slot 1's job: $rout"
+	! grep -q 'slot [23]: waiting' <<<"$rout" || fail "restart waited on idle slot 2 or dead slot 3: $rout"
+	(($(date +%s) - t0 < 30)) || fail "restart took too long"
+	! compgen -G "$rrun/.slot-*.drain" >/dev/null || fail "restart left drain flags behind: $(ls -a "$rrun")"
+	pass "restart skips idle runners, waits for jobs, reports failures"
 
 	# --- the ruleset parses -------------------------------------------------
 	local nft_out
@@ -147,7 +308,7 @@ $nft_out"
 	# --- effective config -----------------------------------------------------
 	[[ "$("$gha" config RUNNER_LABELS)" == "self-hosted,linux,x64,vm,ephemeral,docker" ]] || fail "x64 default labels wrong: $("$gha" config RUNNER_LABELS)"
 	[[ "$("$gha" config GITHUB_API_URL)" == "https://api.github.com" ]] || fail "default API URL wrong"
-	"$gha" config | grep -q '^GITHUB_PAT=$' || fail "config listing should show an empty GITHUB_PAT"
+	grep -q '^GITHUB_PAT=$' <<<"$("$gha" config)" || fail "config listing should show an empty GITHUB_PAT"
 	pass "config prints effective values"
 
 	local alt=/tmp/alt.env
@@ -158,7 +319,7 @@ $nft_out"
 	[[ "$(GHA_CONFIG=$alt "$gha" config QEMU_BIN)" == qemu-system-aarch64 ]] || fail "aarch64 did not select qemu-system-aarch64"
 	[[ "$(GHA_CONFIG=$alt "$gha" config RUNNER_ARCH)" == arm64 ]] || fail "aarch64 did not map to runner arch arm64"
 	[[ "$(GHA_CONFIG=$alt "$gha" config GITHUB_API_URL)" == "https://ghe.example.com/api/v3" ]] || fail "GHES API URL not derived from GITHUB_SERVER_URL"
-	GHA_CONFIG=$alt "$gha" config | grep -q '^GITHUB_PAT=<set>$' || fail "config listing must mask the PAT"
+	grep -q '^GITHUB_PAT=<set>$' <<<"$(GHA_CONFIG=$alt "$gha" config)" || fail "config listing must mask the PAT"
 	[[ "$(GHA_CONFIG=$alt "$gha" config GITHUB_PAT)" == secret ]] || fail "config KEY must print the raw value"
 	pass "arch, GHES and PAT masking"
 

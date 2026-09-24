@@ -30,8 +30,13 @@ LogRateLimitIntervalSec=30
 LogRateLimitBurst=20000
 UMask=0077
 
-# One runaway slot must not take the host down with it.
+# One runaway slot must not take the host down with it; slots with their own
+# VM_MEM_<n> get their own limit from a drop-in. The slice holds the fleet's
+# shared ceiling, and a VM the kernel kills for memory is the supervisor's
+# to report, not a reason to stop the unit.
+Slice=ghavm.slice
 MemoryMax=10240M
+OOMPolicy=continue
 CPUWeight=50
 IOWeight=50
 

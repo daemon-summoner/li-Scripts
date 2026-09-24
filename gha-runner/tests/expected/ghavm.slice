@@ -1,0 +1,8 @@
+[Unit]
+Description=GitHub Actions runner VMs
+Before=slices.target
+
+[Slice]
+MemoryAccounting=yes
+MemoryHigh=24576M
+MemoryMax=26624M
