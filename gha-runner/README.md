@@ -157,7 +157,11 @@ What happens when something is not ready at boot:
   hard reboot would strand one disk image per slot, forever.
 
 Shutdown and reboot are graceful. A slot with a job in flight gets
-`STOP_GRACE_SEC` (15 min) for the job to finish before the VM is killed; the
+`STOP_GRACE_SEC` (15 min) for the job to finish before the VM is killed. A
+slot whose runner is registered but has no job is stopped at once: its runner
+is deregistered first, which GitHub refuses for a busy runner, so a job handed
+out at that moment still gets its grace period. A slot has a job once the
+runner prints `Running job:` on the console. The
 unit's `TimeoutStopSec` is that plus 120 s (VM kill, then the bounded deregistration call). On any exit the supervisor's trap
 kills its QEMU, deregisters the slot's runner from GitHub (`REAP_ON_STOP=1`)
 and removes the run directory. What the trap cannot catch (`kill -9`, power
@@ -175,6 +179,9 @@ sudo gha-vm restart all        # drain every slot, restart its unit, undrain
 ```
 
 `restart` is what to run after editing `gha-vm.sh` and re-running `install`.
+It drains every slot up front, restarts idle ones at once and busy ones as
+their job finishes (up to `STOP_GRACE_SEC`); `gha-vm fleet` shows which is
+which.
 The supervisor also notices when its own script file changes on disk and
 re-execs itself between jobs, so a plain `install` is picked up without a
 restart; `restart` only matters when the unit file itself changed.
@@ -195,8 +202,9 @@ re-applies the policy if the file drifts from the config.
 the profile's `MAX_SLOTS` ceiling if it set one:
 
 ```
-memory   (RAM − HOST_RESERVE_GB) / VM_MEM
-cpu      cores × CPU_OVERCOMMIT / VM_CPUS
+memory   slots 1, 2, ... at their own sizes, until their sum passes
+         FLEET_MEM × MEM_OVERCOMMIT_PCT / 100   (FLEET_MEM=auto: RAM − HOST_RESERVE_GB)
+cpu      slots 1, 2, ... at their own vCPUs, until their sum passes cores × CPU_OVERCOMMIT
 disk     free under STATE_DIR / DISK_PER_SLOT_GB
 ```
 
@@ -213,6 +221,55 @@ Ask any host what it decided:
 gha-vm profile
 ```
 
+### Shared fleet memory
+
+Every slot VM draws from one budget, `FLEET_MEM` (default `auto`: RAM minus
+`HOST_RESERVE_GB`), instead of owning a fixed share. A slot can be bigger or
+smaller than the rest, and can carry its own labels so workflows can ask for it:
+
+```bash
+FLEET_MEM=24G
+VM_MEM=8G
+VM_MEM_1=16G                  # slot 1 is the big one
+RUNNER_LABELS_EXTRA_1=large   # runs-on: [self-hosted, large]
+MEM_OVERCOMMIT_PCT=200        # capacity may plan 16G + 4 x 8G into 24G
+```
+
+A slot registers a runner only when what the VMs really hold (resident memory
+and swap, not page cache) plus that slot's full size fits in the budget.
+Otherwise it waits, first come first served, and says why in the journal and in
+`gha-vm fleet`. Nothing is registered while it waits, so GitHub cannot hand it a
+job the host has no room for. A VM that has just started counts at its full size
+for 5 minutes, which stops several slots that free up together from all taking
+the same gap. Idle guests hand unused pages back through `virtio-balloon`
+free-page-reporting, so light jobs leave room for more slots.
+
+Admission cannot stop a VM that is already running from growing into its full
+size. That growth is bounded by the kernel. All slot units run in
+`ghavm.slice`, which `install` renders with:
+
+- `MemoryHigh` at the budget. Past it the kernel reclaims and swaps inside the
+  slice, so the jobs slow down and the host keeps its reserve. `deps` sets up
+  zram swap for this (`HOST_ZRAM=1`); without swap the kernel can only drop
+  page cache before it has to kill something.
+- `MemoryMax` a margin above the budget (1/16 of it, at least 2 GB) to cover
+  QEMU's own overhead. A fleet that still outgrows that loses one VM to the OOM
+  killer.
+
+Each slot also keeps its own `MemoryMax` of its size plus 2 GB. A slot with
+`VM_MEM_<n>` gets that limit from a drop-in, `gha-vm@<n>.service.d/`.
+
+`FLEET_MEM=off` turns off both the slice limits and the admission wait. With it
+off, the slot count is back to a worst-case partition of the host.
+
+```bash
+gha-vm fleet      # budget, use, and each slot: busy, idle, waiting (and why), drained
+```
+
+After changing `FLEET_MEM` or a `VM_MEM_<n>`, re-run `sudo gha-vm install` to
+push the new limits into systemd. The slice takes them at once. Slots take a new
+per-slot size at their next restart (`gha-vm restart all`).
+
 ### The two plans
 
 | | dedicated CI box | `services` |
@@ -221,12 +278,13 @@ gha-vm profile
 | already resident | ~nothing | ~18 GB (llama-server, minio, clamd, containers) |
 | autotuned reserve | ~8 GB | ~23 GB |
 | per slot | 4 vCPU / 8 GB / 30 GB | 4 vCPU / 8 GB / 30 GB |
-| **slots** | **~15**, memory-bound | **2**, capped by `MAX_SLOTS` |
+| **slots** | **~15**, memory-bound | **5**, 16G + 4 × 8G at 200% of `FLEET_MEM=24G` |
 | profile file | none needed | `profiles/services.env` |
 
 The dedicated box needs no profile — autotune already lands on the right
-number. `services` gets one because two slots is a *policy* about a machine
-that has another job, which no amount of hardware inspection can infer. It is
+number. `services` gets one because its fleet memory budget and big slot 1
+are *policy* about a machine that has another job, which no amount of hardware
+inspection can infer. It is
 also a QEMU guest, so its runner VMs nest; `capacity` says so rather than
 letting the extra latency look like a broken image.
 
@@ -257,6 +315,7 @@ supervisor looks the id up once, at its first registration.
 gha-vm status                  # slots, live VMs, registered runners
 journalctl -fu 'gha-vm@*'      # live guest consoles
 gha-vm capacity
+gha-vm fleet                   # shared memory: budget, use, slots waiting for room
 gha-vm profile                 # which machine am I, what sizing did it pick
 gha-vm config [KEY]            # effective config after profile, local.env, defaults
 sudo gha-vm repair             # fix the mechanically-fixable preflight items
@@ -468,6 +527,11 @@ most of the duplication is anyway.
   HTTP status and any `retry-after` in the journal.
 - A slot refuses to start a VM below `MIN_FREE_GB` free space rather than
   filling the disk.
+- A slot does not register a runner until its VM fits in the fleet memory
+  budget (see "Shared fleet memory"). A VM the kernel OOM-kills, because it
+  passed its slot's `MemoryMax` or the fleet passed the slice's, is logged as
+  `oom-killed` and deregistered. The unit keeps running (`OOMPolicy=continue`)
+  and the slot starts a fresh VM.
 - `flock` per slot stops a hand-started supervisor racing the systemd one, and
   `clean` refuses to touch a directory whose slot lock is held.
 - Each slot reaps only its *own* stale registrations, immediately after a
@@ -491,7 +555,10 @@ container renders the systemd units and the nftables ruleset from
 `tests/config.test.env`, diffs them against `tests/expected/`, runs
 `systemd-analyze verify` and `nft -c` on the result, and exercises the atomic
 config editor (`config-set` / `config-unset`) that `setup.sh` and `upgrade`
-use. Without docker it runs the lint half and says so. Anything involving KVM
+use. It also checks the fleet memory render (slice, per-slot drop-ins, invalid
+settings refused) and `capacity`'s per-slot counting. Admission order and
+fleet accounting are checked against a fixture cgroup tree via
+`GHA_CGROUP_ROOT`. Without docker it runs the lint half and says so. Anything involving KVM
 — booting a VM, a reboot, the drain — can only be verified on a host; see
 "Verifying an upgrade".
 
@@ -514,3 +581,8 @@ use. Without docker it runs the lint half and says so. Anything involving KVM
 | `/var/lib/gha-vm/golden.qcow2.prev` | the previous golden image, for `rollback` |
 | `/var/lib/gha-vm/run/<name>/` | one live VM: overlay, seed, UEFI vars, console log |
 | `/var/lib/gha-vm/run/.slot-<n>.drain` | drain flag; the slot idles while it exists |
+| `/var/lib/gha-vm/run/.slot-<n>.wait` | the slot is waiting for fleet memory, since this epoch |
+| `/var/lib/gha-vm/run/.slot-<n>.claim` | memory a just-started VM may still grow into, counted for 5 min |
+| `/etc/systemd/system/ghavm.slice` | the fleet's shared memory ceiling (`FLEET_MEM`) |
+| `/etc/systemd/system/gha-vm@<n>.service.d/50-gha-vm-size.conf` | per-slot `MemoryMax` from `VM_MEM_<n>` |
+| `/etc/systemd/zram-generator.conf` | zram swap (`HOST_ZRAM`), written only when absent or ours |
