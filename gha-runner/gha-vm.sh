@@ -2187,6 +2187,9 @@ cmd_net() {
 # Reap only this slot's own stale registrations. A host-wide reap here would
 # race a sibling slot whose runner is registered but has not booted yet -- it
 # reads as "offline" and deleting it invalidates that slot's live JIT config.
+# Called only while this slot has no VM, so every runner under its name is
+# stale whatever its status: one whose VM was SIGKILLed still reads "online"
+# until GitHub notices the missed heartbeats.
 reap_slot() {
 	local slot="$1" id runners
 	runners="$(list_runners)" || {
@@ -2199,7 +2202,7 @@ reap_slot() {
 		api DELETE "$(runners_path)/$id" >/dev/null ||
 			log "slot $slot: WARN could not delete runner id=$id; it will be retried next cycle"
 	done < <(jq -r --arg p "${NAME_PREFIX}-${slot}-" \
-		'select(.name | ltrimstr($p) | test("^[0-9a-f]{8}$")) | select(.status=="offline") | .id' <<<"$runners")
+		'select(.name | ltrimstr($p) | test("^[0-9a-f]{8}$")) | .id' <<<"$runners")
 }
 
 reap_one() {
@@ -2693,6 +2696,45 @@ cmd_undrain() {
 	done < <(slot_list "${1:-all}")
 }
 
+# Stops the slot's VM when it has no job, so the unit restart that follows is
+# quick even under a supervisor started from an older script, whose stop waits
+# STOP_GRACE_SEC on any VM. The runner is deregistered first: GitHub refuses
+# to delete a busy one, so a job handed out at that moment shows on the
+# console within seconds and keeps its VM. Returns 1 when the VM has a job.
+vm_pid() { # vm_pid SLOT NAME -> pid of the QEMU running NAME in the slot's unit
+	local cg p
+	cg="$(systemctl show -p ControlGroup --value "gha-vm@$1.service" 2>/dev/null)" || return 0
+	[[ -n "$cg" && -r "$CGROUP_ROOT$cg/cgroup.procs" ]] || return 0
+	while read -r p; do
+		if tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null | grep -qxF -- "$2"; then
+			printf '%s' "$p"
+			return 0
+		fi
+	done <"$CGROUP_ROOT$cg/cgroup.procs"
+}
+
+stop_idle_vm() {
+	local slot="$1" d name pid
+	slot_is_live "$slot" || return 0
+	for d in "$RUN_DIR/${NAME_PREFIX}-${slot}-"*/; do
+		[[ -d "$d" ]] || continue
+		d="${d%/}"
+		name="${d##*/}"
+		pid="$(vm_pid "$slot" "$name")"
+		[[ -n "$pid" ]] || continue
+		vm_has_job "$d" && return 1
+		if ! API_MAXTIME=10 API_RETRY=0 reap_one "$name"; then
+			log "slot $slot: WARN could not deregister $name; checking its console once more before stopping it"
+			sleep 10
+			vm_has_job "$d" && return 1
+		fi
+		log "slot $slot: $name has no job; stopping it"
+		kill -TERM "$pid" 2>/dev/null || true
+		wait_pid "$pid" 30 || kill -KILL "$pid" 2>/dev/null || true
+	done
+	return 0
+}
+
 # Drain every slot, restart each once its VM has no job, undrain. Used after
 # `install` rewrote the unit, or after this script was updated, without losing
 # a running job. Idle slots restart at once; busy ones as their job finishes,
@@ -2716,6 +2758,9 @@ cmd_restart() {
 					continue
 				fi
 				log "slot $s: job still running after ${STOP_GRACE_SEC}s; restarting anyway"
+			elif ! stop_idle_vm "$s"; then
+				left+=("$s")
+				continue
 			fi
 			rm -f "$(drain_flag "$s")"
 			if systemctl restart "gha-vm@${s}.service"; then
@@ -3308,15 +3353,14 @@ cmd_doctor() {
 		if [[ -n "$big" ]]; then
 			echo "FAIL: slot(s)$big are bigger than the ${budget}M budget and can never start"
 			ok=1
+		# The three states `install` fixes warn without failing: doctor is the
+		# preflight setup.sh and bootstrap run before that install.
 		elif [[ ! -e "$FLEET_SLICE" ]]; then
-			echo "ghavm.slice not installed (re-run: $SELF install, then: $SELF restart all)"
-			ok=1
+			echo "WARN: ghavm.slice not installed yet (run: $SELF install, then: $SELF restart all)"
 		elif [[ "$live" =~ ^[0-9]+$ ]] && ! fleet_budget_close "$((live / 1048576))" "$budget"; then
-			echo "ghavm.slice enforces $((live / 1048576))M, config says ${budget}M (re-run: $SELF install)"
-			ok=1
+			echo "WARN: ghavm.slice enforces $((live / 1048576))M, config says ${budget}M (run: $SELF install)"
 		elif [[ -n "$live" && ! "$live" =~ ^[0-9]+$ ]]; then
-			echo "ghavm.slice has no memory limit, config says ${budget}M (re-run: $SELF install)"
-			ok=1
+			echo "WARN: ghavm.slice has no memory limit, config says ${budget}M (run: $SELF install)"
 		elif (($(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024 < budget + $(fleet_slack_mb "$budget"))); then
 			echo "WARN: ${budget}M budget plus $(fleet_slack_mb "$budget")M QEMU margin exceeds RAM; the host may OOM before the slice does"
 		else

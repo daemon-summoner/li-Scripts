@@ -250,6 +250,8 @@ pat=""
 cpus=""
 mem=""
 disk=""
+mem1=""
+pct=""
 
 cur_scope="$(cfg_get SCOPE)"
 cur_org="$(cfg_get GITHUB_ORG)"
@@ -445,6 +447,33 @@ cfg_set_in "$sizing_file" VM_CPUS "$cpus"
 cfg_set_in "$sizing_file" VM_MEM "$mem"
 cfg_set_in "$sizing_file" VM_DISK "$disk"
 
+cur_mem1="$(cfg_get VM_MEM_1)"
+cur_pct="$(cfg_get MEM_OVERCOMMIT_PCT)"
+hint "Slot 1 can be a bigger VM for heavy jobs; workflows reach it with"
+hint "runs-on: [self-hosted, large]. 'none' makes it the same as the others."
+while :; do
+	ask mem1 "Memory for slot 1" "${cur_mem1:-none}"
+	[[ "$mem1" == none ]] && break
+	[[ "$mem1" =~ ^[0-9]+[MGmg]?$ ]] && ((10#${mem1%[MGmg]} > 0)) && break
+	warn "a size like 16G, or none"
+done
+if [[ "$mem1" == none ]]; then
+	"$GHA" config-unset VM_MEM_1 "$sizing_file"
+	"$GHA" config-unset RUNNER_LABELS_EXTRA_1 "$sizing_file"
+else
+	cfg_set_in "$sizing_file" VM_MEM_1 "$mem1"
+	cfg_set_in "$sizing_file" RUNNER_LABELS_EXTRA_1 "$(cfg_get RUNNER_LABELS_EXTRA_1 | grep . || echo large)"
+fi
+hint "All VMs share one memory budget. At 100% the slot count is what fits with"
+hint "every VM at full size; above it, extra slots wait until the VMs' real use"
+hint "leaves room, which is most of the time since jobs rarely peak together."
+while :; do
+	ask pct "Memory overcommit %" "${cur_pct:-100}"
+	[[ "$pct" =~ ^[1-9][0-9]*$ ]] && break
+	warn "a whole percent, e.g. 100 or 200"
+done
+cfg_set_in "$sizing_file" MEM_OVERCOMMIT_PCT "$pct"
+
 # --- 4. image --------------------------------------------------------------
 
 step "4/6  Golden image"
@@ -506,7 +535,20 @@ if [[ -n "$rec" ]] && ((SLOTS > rec)); then
 	ask_yn "Continue with $SLOTS?" n || die "stopped"
 fi
 
+active_before="$(systemctl list-units --no-legend --state=active 'gha-vm@*.service' 2>/dev/null | wc -l)"
 "$GHA" install "$SLOTS" || die "install failed"
+
+# Running supervisors keep the old unit and script until restarted, and an
+# idle runner never finishes a job to pick them up on its own.
+if ((active_before > 0)); then
+	printf '\n'
+	info "$active_before slot(s) were already running the previous version."
+	if ask_yn "Restart them now? (idle slots at once, busy ones after their job)" y; then
+		"$GHA" restart all || die "restart failed; see: journalctl -u 'gha-vm@*'"
+	else
+		warn "they stay on the old version until: sudo gha-vm restart all"
+	fi
+fi
 
 # --- done ------------------------------------------------------------------
 

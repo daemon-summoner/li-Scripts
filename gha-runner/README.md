@@ -77,9 +77,10 @@ On each machine, from a checkout of this directory:
 ```
 
 That is the whole install. It re-execs itself under sudo and walks six steps —
-host dependencies, GitHub connection, VM size, golden image, network isolation,
-slot count — validating each answer as you go and defaulting the slot count to
-what the machine can actually carry. Have the GitHub App ID and its `.pem` handy;
+host dependencies, GitHub connection, VM size (including a bigger slot 1 and
+the memory overcommit, see [Shared fleet memory](#shared-fleet-memory)), golden
+image, network isolation, slot count — validating each answer as you go and
+defaulting the slot count to what the machine can actually carry. Have the GitHub App ID and its `.pem` handy;
 the script copies the key into place with the right owner and mode.
 
 Re-running is the supported way to change anything. Every prompt defaults to the
@@ -181,7 +182,10 @@ sudo gha-vm restart all        # drain every slot, restart its unit, undrain
 `restart` is what to run after editing `gha-vm.sh` and re-running `install`.
 It drains every slot up front, restarts idle ones at once and busy ones as
 their job finishes (up to `STOP_GRACE_SEC`); `gha-vm fleet` shows which is
-which.
+which. An idle slot's VM is stopped by `restart` itself after its runner is
+deregistered, so a supervisor still running an older script never holds the
+restart for its grace period. `setup.sh` offers this restart when it finds
+slots already running.
 The supervisor also notices when its own script file changes on disk and
 re-execs itself between jobs, so a plain `install` is picked up without a
 restart; `restart` only matters when the unit file itself changed.
