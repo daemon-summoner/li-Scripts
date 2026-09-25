@@ -407,10 +407,11 @@ without `--apply`, and `--apply` skips any repo with uncommitted changes — git
 is the undo.
 
 ```bash
-./adopt-runners.py ~/Projects                       # audit only
-./adopt-runners.py ~/Projects --apply               # rewrite runs-on to [self-hosted, linux, x64]
-./adopt-runners.py ~/Projects --apply --label self-hosted,develop
-./adopt-runners.py ~/Projects --arch arm64          # an aarch64 fleet
+./adopt-runners.py                                  # audit ~/Projects (the default root)
+./adopt-runners.py --apply                          # rewrite runs-on to [self-hosted, linux, x64]
+./adopt-runners.py --apply --label self-hosted,develop
+./adopt-runners.py --arch arm64                     # an aarch64 fleet
+./adopt-runners.py ~/work                           # sweep a different directory
 ```
 
 It edits only the `runs-on` line, leaving comments and formatting byte-identical,
