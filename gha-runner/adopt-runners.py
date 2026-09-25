@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Audit every git repo under a directory for gha-vm self-hosted compatibility.
 
-Usage: adopt-runners.py [ROOT] [--apply] [--arch x64|arm64] [--label L[,L...]]
+Usage: adopt-runners.py [ROOT=~/Projects] [--apply] [--arch x64|arm64] [--label L[,L...]]
                         [-q] [--no-blockers]
 Reports jobs pinned to GitHub-hosted runners and steps that would break on the
 golden image; --apply rewrites the movable `runs-on` lines in place.
@@ -348,7 +348,13 @@ def main():
         epilog="Without --apply nothing is written. Exit 1 when any job has a "
         "blocker, so this works as a CI check.",
     )
-    ap.add_argument("root", nargs="?", default=".", type=Path)
+    ap.add_argument(
+        "root",
+        nargs="?",
+        default="~/Projects",
+        type=Path,
+        help="directory to sweep for git repos (default: ~/Projects)",
+    )
     ap.add_argument(
         "--apply",
         action="store_true",
