@@ -399,7 +399,8 @@ register with these labels:
 self-hosted, linux, x64, vm, ephemeral, docker, <short hostname>
 ```
 
-(`arm64` in place of `x64` on an aarch64 host.)
+(`arm64` in place of `x64` on an aarch64 host, and `kvm` added on a host with
+`NESTED_VIRT=1`; see Nested virtualization.)
 
 `adopt-runners.py` sweeps a directory of repos and reports every job that could
 move, plus every step that would break on the golden image. It writes nothing
@@ -428,10 +429,10 @@ image does not:
 
 | Blocker | Why |
 |---|---|
-| `sudo` | the guest `runner` user is created with `-G docker` only |
+| `sudo` | the guest `runner` user is created with `-G docker,kvm` only |
 | node / pip / go / java / dotnet / rust | not installed; add the matching `actions/setup-*` |
-| `gh`, `aws`, `az`, `gcloud`, `kubectl`, `helm`, `terraform` | not installed |
-| nested virt | Android emulator, `vagrant`, `qemu-system-x86_64` — `NESTED_VIRT=0` |
+| `aws`, `az`, `gcloud`, `kubectl`, `helm`, `terraform` | not installed |
+| nested virt | Android emulator, `vagrant`, `qemu-system-x86_64` — `NESTED_VIRT=0`; not reported for a job whose `runs-on` includes `kvm` |
 
 A job already calling the right `actions/setup-*` is not flagged for it, and a
 `container:` job is only checked for nested virt, since its steps run inside its
@@ -511,15 +512,43 @@ Re-run `sudo gha-vm image` after changing any of these; they are baked in.
 runs attacker-authored code on your hardware. Use a private repo, or restrict
 the runner group to private repos.
 
-Nested virtualization is not exposed to guests (`NESTED_VIRT=0`). It widens the
-KVM attack surface that the whole isolation model rests on. Turn it on only if a
-workflow genuinely needs it.
-
 KSM is deliberately left off. It would dedupe memory across identical guests,
 but merging pages between VMs running untrusted job code is a cross-VM
 information leak, and the balloon already recovers idle memory. The guests do
 share the golden image's page cache through the backing file, which is where
 most of the duplication is anyway.
+
+### Nested virtualization
+
+Nested virtualization is not exposed to guests (`NESTED_VIRT=0`). It widens the
+KVM attack surface that the whole isolation model rests on. Turn it on only if a
+workflow genuinely needs it, such as an Android emulator job, and only on a
+bare-metal x64 host: a host that is itself a VM would put the emulator at a
+third level.
+
+The image is always ready for it. The guest `runner` user is in the `kvm`
+group, and the image carries the libraries the Android emulator loads that the
+Ubuntu cloud image lacks (`libxi6 libpulse0 libxkbfile1 libgbm1 libsm6
+libice6`). Enabling it on one host:
+
+```bash
+echo 'options kvm_intel nested=1' | sudo tee /etc/modprobe.d/gha-vm-nested.conf   # kvm_amd on AMD
+echo NESTED_VIRT=1 | sudo tee -a /etc/gha-vm/profiles/local.env
+sudo reboot        # reloads kvm with the option; slots drain first and return on their own
+sudo gha-vm doctor # nested virt: OK
+```
+
+Current kernels already default both modules to `nested=1`; the modprobe file
+keeps it pinned. When `doctor` already reports the module OK, `sudo gha-vm
+restart all` is enough instead of the reboot.
+
+Runners on that host then register with an extra `kvm` label (`gha-vm profile`
+prints the labels), and emulator jobs ask for it, so they never land on a host
+without KVM:
+
+```yaml
+runs-on: [self-hosted, linux, x64, kvm]
+```
 
 ## Failure handling
 
@@ -551,7 +580,7 @@ most of the duplication is anyway.
 ## Tests
 
 ```bash
-tests/run.sh             # lint, then render + verify in docker (ubuntu:24.04)
+tests/run.sh             # lint, then render + verify in docker (ubuntu:26.04)
 tests/run.sh --update    # regenerate tests/expected after an intended change
 ```
 

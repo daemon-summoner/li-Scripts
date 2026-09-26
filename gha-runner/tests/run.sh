@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Test suite for gha-vm.sh. Lints on the host, then renders the systemd units
-# and the nftables ruleset from tests/config.test.env inside ubuntu:24.04 and
+# and the nftables ruleset from tests/config.test.env inside ubuntu:26.04 and
 # diffs them against tests/expected, checks them with systemd-analyze and nft,
 # and exercises the atomic config editor.
 #   tests/run.sh            run everything (docker needed for the render part)
@@ -9,7 +9,7 @@ set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 ROOT="$(dirname "$HERE")"
-IMAGE="${GHA_TEST_IMAGE:-ubuntu:24.04}"
+IMAGE="${GHA_TEST_IMAGE:-ubuntu:26.04}"
 
 fail() {
 	printf 'FAIL: %s\n' "$*" >&2
@@ -25,7 +25,7 @@ inside() {
 	local update="$1" out=/out rc=0
 	export DEBIAN_FRONTEND=noninteractive
 	apt-get update -qq >/dev/null
-	apt-get install -y -qq --no-install-recommends systemd nftables >/dev/null
+	apt-get install -y -qq --no-install-recommends systemd nftables jq >/dev/null
 	groupadd -f kvm
 	id -u gha >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -u 999 gha
 	install -d -m 0750 -g gha /etc/gha-vm
@@ -339,6 +339,23 @@ $nft_out"
 	grep -q '^GITHUB_PAT=<set>$' <<<"$(GHA_CONFIG=$alt "$gha" config)" || fail "config listing must mask the PAT"
 	[[ "$(GHA_CONFIG=$alt "$gha" config GITHUB_PAT)" == secret ]] || fail "config KEY must print the raw value"
 	pass "arch, GHES and PAT masking"
+
+	# The kvm label promises a guest /dev/kvm, so it rides on NESTED_VIRT=1 alone
+	# and never on arm64, where guest_cpu_model does not expose nesting.
+	local nv=/tmp/nv.env labels
+	labels="$("$gha" profile 2>/dev/null | sed -n 's/^labels  *//p')"
+	[[ -n "$labels" ]] || fail "profile printed no labels line"
+	[[ ",$labels," != *,kvm,* ]] || fail "NESTED_VIRT=0 host advertises kvm: $labels"
+	{
+		cat /tests/config.test.env
+		printf 'NESTED_VIRT=1\n'
+	} >"$nv"
+	labels="$(GHA_CONFIG=$nv "$gha" profile 2>/dev/null | sed -n 's/^labels  *//p')"
+	[[ ",$labels," == *,kvm,* ]] || fail "NESTED_VIRT=1 x64 host lacks the kvm label: $labels"
+	printf 'HOST_ARCH=aarch64\n' >>"$nv"
+	labels="$(GHA_CONFIG=$nv "$gha" profile 2>/dev/null | sed -n 's/^labels  *//p')"
+	[[ -n "$labels" && ",$labels," != *,kvm,* ]] || fail "arm64 host advertises kvm: $labels"
+	pass "kvm label follows NESTED_VIRT on x64 only"
 
 	printf 'SCOPE=org\nGITHUB_ORG=x\nAUTH_MODE=app\nRUNNER_VERSION=2.336.0\nGHA_UID=999\nAUTOTUNE=0\nVM_MEM=lots\n' >/tmp/bad.env
 	if GHA_CONFIG=/tmp/bad.env GHA_SYSTEMD_DIR=/tmp/bad GHA_NFT_CONF=/tmp/bad/n.conf "$gha" render 2>/dev/null; then

@@ -217,7 +217,9 @@ apply_defaults() {
 	NET_ENDPOINT_ADDRS="${NET_ENDPOINT_ADDRS:-}"
 
 	# Golden image build and swap.
-	GUEST_PACKAGES="${GUEST_PACKAGES:-docker.io,git,jq,curl,unzip,zip,ca-certificates,build-essential,rsync,gnupg}"
+	# The last six are the Android emulator libraries the 26.04 cloud image lacks;
+	# the emulator runs only on a NESTED_VIRT=1 host, where it fails without them.
+	GUEST_PACKAGES="${GUEST_PACKAGES:-docker.io,git,jq,curl,unzip,zip,ca-certificates,build-essential,rsync,gnupg,gh,xz-utils,procps,libxi6,libpulse0,libxkbfile1,libgbm1,libsm6,libice6}"
 	GUEST_EXTRA_PACKAGES="${GUEST_EXTRA_PACKAGES:-}"
 	IMAGE_HOOK_DIR="${IMAGE_HOOK_DIR:-$(dirname "$CONFIG")/image.d}"
 	GUEST_PRE_JOB_HOOK="${GUEST_PRE_JOB_HOOK:-}"
@@ -859,10 +861,12 @@ list_runners() {
 
 # Labels as a JSON array: trimmed, empties dropped, duplicates collapsed, with
 # the host's short name appended when RUNNER_LABELS_APPEND_HOST=1 so a workflow
-# can pin one machine with runs-on: [self-hosted, <hostname>].
+# can pin one machine with runs-on: [self-hosted, <hostname>], and `kvm` when
+# guests get nested virtualization, so emulator jobs land only where it works.
 runner_labels_json() {
 	local l="$RUNNER_LABELS"
 	[[ "$RUNNER_LABELS_APPEND_HOST" == 1 ]] && l+=",$(hostname -s)"
+	nested_virt_exposed && l+=",kvm"
 	jq -nc --arg l "$l" \
 		'$l | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | unique'
 }
@@ -1673,7 +1677,8 @@ or set ALLOW_UNVERIFIED_RUNNER=1 to install it unverified."
 		--update \
 		--install "$guest_pkgs" \
 		--run-command 'apt-get purge -y snapd || true' \
-		--run-command 'useradd -m -s /bin/bash -G docker runner' \
+		--run-command 'groupadd -f kvm' \
+		--run-command 'useradd -m -s /bin/bash -G docker,kvm runner' \
 		--run-command 'install -d -o runner -g runner /opt/actions-runner' \
 		--run-command "cd /opt/actions-runner \
         && { [ ! -r /etc/gha-proxy.env ] || { set -a; . /etc/gha-proxy.env; set +a; }; } \
@@ -2303,6 +2308,11 @@ wait_for_clock() {
 		w=$((w + 5))
 	done
 	return 0
+}
+
+# Whether guests see VMX/SVM: guest_cpu_model masks it only for x64 `host`.
+nested_virt_exposed() {
+	[[ "$NESTED_VIRT" == 1 && "$RUNNER_ARCH" == x64 ]]
 }
 
 # -cpu host with nested virtualization masked off unless NESTED_VIRT=1: exposing
@@ -2936,6 +2946,7 @@ cmd_profile() {
 		"$(nproc)" "$ram" "${avail:-0}" "$STATE_DIR"
 	printf 'virtualised    %s\n' "$(host_is_virtual && echo 'yes (runner VMs nest)' || echo no)"
 	printf 'kvm            %s\n' "$([[ -c /dev/kvm ]] && echo present || echo ABSENT)"
+	printf 'labels         %s\n' "$(runner_labels_json | jq -r 'join(",")')"
 	printf '\nprofile        %s\n' "$HOST_PROFILE"
 	if [[ -n "$PROFILE_FILE" ]]; then
 		printf 'loaded from    %s\n' "$PROFILE_FILE"
@@ -3175,6 +3186,25 @@ cmd_doctor() {
 			ok=1
 		else
 			echo "FAIL: CPU exposes neither vmx nor svm; enable virtualization in the BIOS"
+			ok=1
+		fi
+	fi
+
+	# The `kvm` label promises emulator jobs a working /dev/kvm in the guest, which
+	# also needs the host module's nested flag and a CPU model that carries VMX/SVM.
+	printf 'nested virt: '
+	if ! nested_virt_exposed; then
+		echo "off (NESTED_VIRT=$NESTED_VIRT, $RUNNER_ARCH); guests have no /dev/kvm"
+	else
+		local nested=""
+		[[ -n "$kvmmod" ]] && nested="$(cat "/sys/module/$kvmmod/parameters/nested" 2>/dev/null)"
+		if [[ "$VM_CPU" != host ]]; then
+			echo "FAIL: NESTED_VIRT=1 needs VM_CPU=host (got '$VM_CPU'); guests would carry the kvm label without VMX/SVM"
+			ok=1
+		elif [[ "$nested" == Y || "$nested" == 1 ]]; then
+			echo "OK ($kvmmod nested=$nested; runners carry the kvm label)"
+		else
+			echo "FAIL: NESTED_VIRT=1 but ${kvmmod:-the kvm module} has nested=${nested:-unknown}; set 'options ${kvmmod:-kvm_intel} nested=1' in /etc/modprobe.d/ and reload the module"
 			ok=1
 		fi
 	fi
