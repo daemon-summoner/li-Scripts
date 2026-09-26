@@ -98,11 +98,6 @@ MISSING = [
     (("dotnet",), "no .NET SDK", "add actions/setup-dotnet"),
     (("cargo", "rustc", "rustup"), "no Rust toolchain", "add dtolnay/rust-toolchain"),
     (
-        ("gh",),
-        "the GitHub CLI is not installed",
-        "install it in a step, or use actions/github-script",
-    ),
-    (
         ("aws", "az", "gcloud", "kubectl", "helm", "terraform", "ansible"),
         "no cloud CLI is installed",
         "install it in a step",
@@ -110,9 +105,9 @@ MISSING = [
 ]
 
 # Its own entry because the cause is not a missing package: the guest user is
-# created with `-G docker` and nothing else, so sudo refuses it. GitHub-hosted
+# created with `-G docker,kvm` and nothing else, so sudo refuses it. GitHub-hosted
 # grants `runner` passwordless sudo, which is why workflows assume it freely.
-SUDO_WHY = "the guest `runner` user has no sudo (created with -G docker only)"
+SUDO_WHY = "the guest `runner` user has no sudo (created with -G docker,kvm only)"
 SUDO_FIX = (
     "give the image's runner passwordless sudo -- it is already"
     " root-equivalent through the docker group, so this removes no"
@@ -121,7 +116,10 @@ SUDO_FIX = (
 
 # These jobs run a VM of their own, so they need /dev/kvm inside a guest that is
 # already a VM. gha-vm ships NESTED_VIRT=0 deliberately, and the failure surfaces
-# as a missing-accelerator error that says nothing about nesting.
+# as a missing-accelerator error that says nothing about nesting. A host with
+# NESTED_VIRT=1 registers its runners with KVM_LABEL, so a job that asks for it
+# can only land where the emulator works.
+KVM_LABEL = "kvm"
 NESTED_ACTIONS = (
     "reactivecircus/android-emulator-runner",
     "ChristopherHX/android-emulator-runner",
@@ -129,9 +127,9 @@ NESTED_ACTIONS = (
 NESTED_CMDS = ("kvm-ok", "qemu-system-x86_64", "vagrant")
 NESTED_WHY = "needs nested virtualisation; gha-vm sets NESTED_VIRT=0"
 NESTED_FIX = (
-    "keep this job on GitHub-hosted, or set NESTED_VIRT=1 in"
-    " /etc/gha-vm/config.env -- which widens the KVM attack surface the whole"
-    " isolation model rests on"
+    "keep this job on GitHub-hosted, or set NESTED_VIRT=1 on one bare-metal"
+    " host (it widens the KVM attack surface the whole isolation model rests"
+    f" on) and add `{KVM_LABEL}` to this job's runs-on"
 )
 
 # The setup action that supplies each toolchain, so a job that already calls one
@@ -203,7 +201,13 @@ def job_blockers(job):
 
     # Checked before the container short-circuit: a container cannot conjure
     # /dev/kvm that the guest kernel was never given.
-    if actions.intersection(NESTED_ACTIONS) or any(c in script for c in NESTED_CMDS):
+    runs_on = job.get("runs-on")
+    wants_kvm = runs_on == KVM_LABEL or (
+        isinstance(runs_on, list) and KVM_LABEL in runs_on
+    )
+    if not wants_kvm and (
+        actions.intersection(NESTED_ACTIONS) or any(c in script for c in NESTED_CMDS)
+    ):
         found.append(("nested virt", NESTED_WHY, NESTED_FIX))
 
     # A container: job runs its steps inside that image, so the host's missing
