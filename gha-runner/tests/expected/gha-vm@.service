@@ -37,6 +37,9 @@ UMask=0077
 Slice=ghavm.slice
 MemoryMax=10240M
 OOMPolicy=continue
+# If the host as a whole runs out, the kernel kills a runner VM before any of
+# the services this host exists for.
+OOMScoreAdjust=500
 CPUWeight=50
 IOWeight=50
 

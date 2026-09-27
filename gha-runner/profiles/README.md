@@ -59,6 +59,9 @@ VM_DISK=80G
 #RUNNER_LABELS_EXTRA_1=large   # ...that workflows reach with runs-on: [self-hosted, large]
 #FLEET_MEM=auto        # memory all VMs share; auto = RAM - HOST_RESERVE_GB
 #MEM_OVERCOMMIT_PCT=100
+#HOST_MEM_FLOOR=auto   # MemAvailable the VMs always leave to other services; 0 = off
+#HOST_PSI_MAX=10       # memory pressure % at which no VM starts and idle ones are shed
+#FLEET_SWAP_MAX=auto   # host swap the fleet may fill; auto = budget / 8
 DISK_PER_SLOT_GB=30
 HOST_RESERVE_GB=8      # a floor; autotune only ever raises it
 MIN_FREE_GB=20

@@ -40,7 +40,7 @@ inside() {
 	GHA_SYSTEMD_DIR="$out" GHA_NFT_CONF="$out/nftables.conf" "$gha" render 2>/dev/null ||
 		fail "render exited non-zero"
 	local f
-	for f in gha-vm@.service ghavm.slice gha-vm@1.service.d/50-gha-vm-size.conf gha-vm-upgrade.service gha-vm-upgrade.timer nftables.conf; do
+	for f in gha-vm@.service ghavm.slice gha-vm@1.service.d/50-gha-vm-size.conf gha-vm-upgrade.service gha-vm-upgrade.timer gha-vm-memguard.service nftables.conf; do
 		[[ -s "$out/$f" ]] || fail "render produced no $f"
 		if ((update)); then
 			install -D -m 0644 "$out/$f" "/tests/expected/$f"
@@ -56,9 +56,9 @@ inside() {
 	# --- the units load in systemd -------------------------------------------
 	local v=/tmp/verify
 	install -d "$v"
-	cp -r "$out"/gha-vm@.service "$out"/ghavm.slice "$out"/gha-vm@1.service.d "$out"/gha-vm-upgrade.service "$out"/gha-vm-upgrade.timer "$v/"
+	cp -r "$out"/gha-vm@.service "$out"/ghavm.slice "$out"/gha-vm@1.service.d "$out"/gha-vm-upgrade.service "$out"/gha-vm-upgrade.timer "$out"/gha-vm-memguard.service "$v/"
 	local verify_out
-	verify_out="$(systemd-analyze verify --recursive-errors=no "$v/gha-vm@1.service" "$v/ghavm.slice" "$v/gha-vm-upgrade.service" "$v/gha-vm-upgrade.timer" 2>&1)" ||
+	verify_out="$(systemd-analyze verify --recursive-errors=no "$v/gha-vm@1.service" "$v/ghavm.slice" "$v/gha-vm-upgrade.service" "$v/gha-vm-upgrade.timer" "$v/gha-vm-memguard.service" 2>&1)" ||
 		fail "systemd-analyze verify failed:
 $verify_out"
 	if grep -Eiq 'unknown|failed|invalid|ignoring' <<<"$verify_out"; then
@@ -77,6 +77,10 @@ $verify_out"
 	grep -qx 'OOMPolicy=continue' "$out/gha-vm@.service" || fail "an OOM-killed VM would stop the slot unit"
 	grep -qx 'MemoryHigh=24576M' "$out/ghavm.slice" || fail "slice MemoryHigh is not FLEET_MEM"
 	grep -qx 'MemoryMax=26624M' "$out/ghavm.slice" || fail "slice MemoryMax is not FLEET_MEM plus the 2G minimum margin"
+	grep -qx 'MemorySwapMax=3072M' "$out/ghavm.slice" || fail "slice MemorySwapMax is not 1/8 of FLEET_MEM"
+	grep -qx 'OOMScoreAdjust=500' "$out/gha-vm@.service" || fail "a host-wide OOM would not pick a runner VM first"
+	grep -qx 'ExecStart=/usr/local/lib/gha-vm/gha-vm.sh memguard' "$out/gha-vm-memguard.service" || fail "memguard unit does not run memguard"
+	grep -qx 'OOMScoreAdjust=-900' "$out/gha-vm-memguard.service" || fail "memguard is not shielded from the OOM killer"
 	grep -qx 'MemoryMax=18432M' "$out/gha-vm@1.service.d/50-gha-vm-size.conf" || fail "slot 1 drop-in is not VM_MEM_1+2048M"
 	[[ ! -e "$out/gha-vm@2.service.d" ]] || fail "slot 2 has no override but got a drop-in"
 	pass "fleet slice and per-slot drop-in carry the shared and per-slot limits"
@@ -93,8 +97,18 @@ $verify_out"
 	GHA_CONFIG=$fl/cfg.env GHA_SYSTEMD_DIR=$fl/off GHA_NFT_CONF=$fl/off/n.conf "$gha" render 2>/dev/null ||
 		fail "render failed with FLEET_MEM=off"
 	grep -qx 'MemoryAccounting=yes' "$fl/off/ghavm.slice" || fail "FLEET_MEM=off lost the slice"
-	! grep -q '^Memory\(High\|Max\)=' "$fl/off/ghavm.slice" || fail "FLEET_MEM=off still limits the slice"
+	! grep -q '^Memory\(High\|Max\|SwapMax\)=' "$fl/off/ghavm.slice" || fail "FLEET_MEM=off still limits the slice"
 	pass "FLEET_MEM=off renders a slice without limits"
+
+	fleet_env <<<$'FLEET_MEM=24G\nFLEET_SWAP_MAX=max'
+	GHA_CONFIG=$fl/cfg.env GHA_SYSTEMD_DIR=$fl/swapmax GHA_NFT_CONF=$fl/swapmax/n.conf "$gha" render 2>/dev/null ||
+		fail "render failed with FLEET_SWAP_MAX=max"
+	! grep -q '^MemorySwapMax=' "$fl/swapmax/ghavm.slice" || fail "FLEET_SWAP_MAX=max still caps the slice's swap"
+	fleet_env <<<$'FLEET_MEM=24G\nFLEET_SWAP_MAX=1'
+	GHA_CONFIG=$fl/cfg.env GHA_SYSTEMD_DIR=$fl/swap1 GHA_NFT_CONF=$fl/swap1/n.conf "$gha" render 2>/dev/null ||
+		fail "render failed with FLEET_SWAP_MAX=1"
+	grep -qx 'MemorySwapMax=1024M' "$fl/swap1/ghavm.slice" || fail "bare FLEET_SWAP_MAX=1 was not read as 1G"
+	pass "FLEET_SWAP_MAX caps or uncaps the slice's swap"
 
 	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_3=16'
 	GHA_CONFIG=$fl/cfg.env GHA_SYSTEMD_DIR=$fl/stale GHA_NFT_CONF=$fl/stale/n.conf "$gha" render 2>/dev/null ||
@@ -116,7 +130,8 @@ $verify_out"
 	pass "per-slot drop-ins follow VM_MEM_<n>, sparing the operator's own"
 
 	local bad
-	for bad in 'FLEET_MEM=lots' 'FLEET_MEM=0G' 'VM_MEM_1=lots' 'VM_MEM_0=8G' 'VM_CPUS_2=0' 'MEM_OVERCOMMIT_PCT=0' 'HOST_ZRAM=2' 'HOST_ZRAM_SIZE="ram; x"'; do
+	for bad in 'FLEET_MEM=lots' 'FLEET_MEM=0G' 'VM_MEM_1=lots' 'VM_MEM_0=8G' 'VM_CPUS_2=0' 'MEM_OVERCOMMIT_PCT=0' 'HOST_ZRAM=2' 'HOST_ZRAM_SIZE="ram; x"' \
+		'FLEET_SWAP_MAX=lots' 'HOST_MEM_FLOOR=lots' 'HOST_PSI_MAX=101' 'HOST_PSI_MAX=x' 'MEMGUARD_INTERVAL=0'; do
 		fleet_env <<<"$bad"
 		if GHA_CONFIG=$fl/cfg.env GHA_SYSTEMD_DIR=$fl/bad GHA_NFT_CONF=$fl/bad/n.conf "$gha" render 2>/dev/null; then
 			fail "render accepted $bad"
@@ -143,8 +158,17 @@ $verify_out"
 	# Fleet accounting from a fixture cgroup tree: page cache is not load,
 	# swap is; a live earlier waiter goes first, a dead one does not; a VM
 	# admitted moments ago still counts at its full size.
-	local cg=$fl/cg run=$fl/run now
+	local cg=$fl/cg run=$fl/run proc=$fl/proc now
 	now=$(date +%s)
+	# The host checks read this instead of the container's real /proc: 48000M
+	# of RAM (floor 4800M), 40000M available, no pressure.
+	host_mem() { # MemAvailable MiB, PSI some avg10
+		printf 'MemTotal:       %s kB\nMemAvailable:   %s kB\n' $((48000 * 1024)) $(($1 * 1024)) >"$proc/meminfo"
+		printf 'some avg10=%s avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n' "$2" >"$proc/pressure/memory"
+	}
+	install -d "$proc/pressure"
+	host_mem 40000 0.00
+	export GHA_PROC_ROOT=$proc
 	install -d "$cg/ghavm.slice/gha-vm@1.service" "$cg/ghavm.slice/gha-vm@2.service" "$run/gha-test-1-abcd" "$run/gha-test-2-ef01"
 	printf 'GHA-VM: runner starting\n2026-01-01 00:00:00Z: Running job: build\n' >"$run/gha-test-1-abcd/console.log"
 	printf 'GHA-VM: runner starting\n2026-01-01 00:00:00Z: Listening for Jobs\n' >"$run/gha-test-2-ef01/console.log"
@@ -183,12 +207,84 @@ $verify_out"
 	echo "$((now - 600)) 16384" >"$run/.slot-2.claim"
 	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
 	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s$' <<<"$fo" || fail "an expired claim still blocks slot 3: $fo"
-	fleet_env <<<'FLEET_MEM=off'
+	grep -q '^host       40000M available, 4800M kept for other services, pressure 0% (limit 10%)$' <<<"$fo" ||
+		fail "fleet does not report the host's memory: $fo"
+
+	# The host's own memory gates admission even with fleet budget to spare:
+	# 12000M available cannot take 8192M and still leave the 4800M floor.
+	host_mem 12000 0.00
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: host has 12000M available; this slot needs 8192M and 4800M stays free for other services$' <<<"$fo" ||
+		fail "slot 3 should wait for the host's memory: $fo"
+	host_mem 13000 0.00
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s$' <<<"$fo" || fail "13000M available fits 8192M above the 4800M floor: $fo"
+	host_mem 40000 25.31
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: host memory pressure at 25% \(HOST_PSI_MAX=10\)$' <<<"$fo" ||
+		fail "slot 3 should wait out memory pressure: $fo"
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nHOST_PSI_MAX=0\nRUN_DIR='"$run"
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s$' <<<"$fo" || fail "HOST_PSI_MAX=0 should ignore pressure: $fo"
+	host_mem 2000 0.00
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nHOST_MEM_FLOOR=0\nRUN_DIR='"$run"
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s$' <<<"$fo" || fail "HOST_MEM_FLOOR=0 should turn the host check off: $fo"
+	grep -q '^host       unguarded' <<<"$fo" || fail "HOST_MEM_FLOOR=0 not reported: $fo"
+
+	fleet_env <<<$'FLEET_MEM=off\nRUN_DIR='"$run"
 	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero with FLEET_MEM=off"
 	grep -q '^budget     off' <<<"$fo" || fail "FLEET_MEM=off not reported: $fo"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: host has 2000M available' <<<"$fo" ||
+		fail "FLEET_MEM=off should still keep the host floor: $fo"
 	kill "${holders[@]}"
 	wait "${holders[@]}" || :
-	pass "fleet accounting, claims and FIFO admission order"
+	pass "fleet accounting, claims, FIFO order and the host memory floor and pressure gates"
+
+	# memguard: the live ceiling follows the fleet's anonymous memory plus
+	# what the host has above its floor, capped at the installed MemoryHigh
+	# (20480M here, not the config's 24G), and goes back up on stop.
+	local mg=$fl/mg mgcg=$fl/mg/cg sl
+	sl=$mgcg/ghavm.slice
+	install -d "$sl" "$mg/sd"
+	: >"$mgcg/cgroup.controllers"
+	printf '[Slice]\nMemoryHigh=20480M\nMemoryMax=22528M\n' >"$mg/sd/ghavm.slice"
+	echo $((10240 * 1048576)) >"$sl/memory.current"
+	printf 'anon 1\nfile %s\n' $((2048 * 1048576)) >"$sl/memory.stat"
+	echo max >"$sl/memory.high"
+	echo max >"$sl/memory.max"
+	fleet_env <<<'FLEET_MEM=24G'
+	mg_once() { GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$mgcg GHA_SYSTEMD_DIR=$mg/sd "$gha" memguard --once 2>/dev/null; }
+	host_mem 6144 0.00
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((9536 * 1048576)) ]] || fail "memguard high should be 8192M anon + 6144M - 4800M floor: $(<"$sl/memory.high")"
+	[[ "$(<"$sl/memory.max")" == $((11584 * 1048576)) ]] || fail "memguard max should be high + 2048M: $(<"$sl/memory.max")"
+	echo $(((9536 + 200) * 1048576)) >"$sl/memory.high"
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $(((9536 + 200) * 1048576)) ]] || fail "memguard rewrote a limit within its 256M step"
+	host_mem 40000 0.00
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((20480 * 1048576)) ]] || fail "memguard should cap at the installed 20480M: $(<"$sl/memory.high")"
+	echo $((2048 * 1048576)) >"$sl/memory.current"
+	host_mem 2000 0.00
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((1024 * 1048576)) ]] || fail "memguard should bottom out at 1024M: $(<"$sl/memory.high")"
+	fleet_env <<<$'FLEET_MEM=24G\nMEMGUARD_INTERVAL=1'
+	echo max >"$sl/memory.high"
+	GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$mgcg GHA_SYSTEMD_DIR=$mg/sd "$gha" memguard 2>/dev/null &
+	local mgpid=$!
+	sleep 2
+	[[ "$(<"$sl/memory.high")" == $((1024 * 1048576)) ]] || fail "the memguard loop did not lower the ceiling: $(<"$sl/memory.high")"
+	kill -TERM "$mgpid"
+	wait "$mgpid" || fail "memguard did not exit cleanly on TERM"
+	[[ "$(<"$sl/memory.high")" == $((20480 * 1048576)) ]] || fail "memguard left the fleet pinned on stop: $(<"$sl/memory.high")"
+	[[ "$(<"$sl/memory.max")" == $((22528 * 1048576)) ]] || fail "memguard did not restore MemoryMax on stop: $(<"$sl/memory.max")"
+	fleet_env <<<$'FLEET_MEM=24G\nHOST_MEM_FLOOR=0'
+	if mg_once; then fail "memguard ran with HOST_MEM_FLOOR=0"; fi
+	fleet_env <<<'FLEET_MEM=off'
+	if mg_once; then fail "memguard ran with FLEET_MEM=off"; fi
+	unset GHA_PROC_ROOT
+	pass "memguard follows the host, keeps its step, caps, floors, and restores on stop"
 
 	# restart: an idle runner is not a running job. Slots 2 (idle) and 3 (a
 	# job's run dir left by a killed supervisor) restart at once, slot 1 once

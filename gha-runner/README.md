@@ -260,11 +260,17 @@ size. That growth is bounded by the kernel. All slot units run in
   QEMU's own overhead. A fleet that still outgrows that loses one VM to the OOM
   killer.
 
-Each slot also keeps its own `MemoryMax` of its size plus 2 GB. A slot with
-`VM_MEM_<n>` gets that limit from a drop-in, `gha-vm@<n>.service.d/`.
+- `MemorySwapMax` at 1/8 of the budget (`FLEET_SWAP_MAX`), so a throttled
+  fleet cannot fill the swap the rest of the host relies on or push the disk
+  behind it into IO wait.
 
-`FLEET_MEM=off` turns off both the slice limits and the admission wait. With it
-off, the slot count is back to a worst-case partition of the host.
+Each slot also keeps its own `MemoryMax` of its size plus 2 GB. A slot with
+`VM_MEM_<n>` gets that limit from a drop-in, `gha-vm@<n>.service.d/`. Slot
+units carry `OOMScoreAdjust=500`, so if the host as a whole runs out, the kernel
+kills a runner VM before sshd, tailscaled or any other service.
+
+`FLEET_MEM=off` turns off the slice limits and the budget wait. With it off, the
+slot count is back to a worst-case partition of the host.
 
 ```bash
 gha-vm fleet      # budget, use, and each slot: busy, idle, waiting (and why), drained
@@ -273,6 +279,39 @@ gha-vm fleet      # budget, use, and each slot: busy, idle, waiting (and why), d
 After changing `FLEET_MEM` or a `VM_MEM_<n>`, re-run `sudo gha-vm install` to
 push the new limits into systemd. The slice takes them at once. Slots take a new
 per-slot size at their next restart (`gha-vm restart all`).
+
+### Sharing the host with other services
+
+The budget is fixed at install time and cannot see a model server load, a
+container grow or a tmpfs fill. Three checks follow the host itself, so the
+fleet gives memory back instead of the host swapping itself to a standstill:
+
+- **Admission.** A slot registers a runner only while the host's
+  `MemAvailable`, minus what VMs still starting will grow into, covers its full
+  size plus `HOST_MEM_FLOOR` (default: the larger of 4 GB and a tenth of RAM),
+  and while memory pressure (PSI `some` avg10) is below `HOST_PSI_MAX` (10%).
+  Otherwise it waits, and `gha-vm fleet` says so.
+- **Shedding.** A booted runner with no job, on a host that has stayed under
+  the floor or over the pressure limit for 30 seconds, is deregistered and its
+  VM stopped. The slot then queues for admission like any other. A runner that
+  already has a job is never shed: GitHub refuses to delete a busy runner, and
+  the VM is only stopped after that delete succeeds.
+- **memguard.** `gha-vm-memguard.service` (root, no network, no capabilities)
+  moves `ghavm.slice`'s live `MemoryHigh` every `MEMGUARD_INTERVAL` seconds to
+  what the VMs hold in anonymous memory plus the host's `MemAvailable` above
+  the floor, never past the installed ceiling, with `MemoryMax` the usual
+  margin above. When another service grows, running jobs are throttled and,
+  past `MemoryMax`, one VM is OOM-killed while the host keeps its floor. As
+  memory frees up the limits rise back; stopping the service restores them.
+
+`HOST_MEM_FLOOR=0` turns all three off. They apply with `FLEET_MEM=off` too,
+except memguard, which needs a ceiling to move.
+
+```bash
+gha-vm fleet                          # "host" line: available, floor, pressure
+journalctl -u gha-vm-memguard         # every time the ceiling moves by 1 GB or more
+journalctl -u 'gha-vm@*' | grep shed  # idle runners given back
+```
 
 ### The two plans
 
@@ -562,7 +601,9 @@ runs-on: [self-hosted, linux, x64, kvm]
 - A slot refuses to start a VM below `MIN_FREE_GB` free space rather than
   filling the disk.
 - A slot does not register a runner until its VM fits in the fleet memory
-  budget (see "Shared fleet memory"). A VM the kernel OOM-kills, because it
+  budget and the host has it to spare (see "Shared fleet memory" and "Sharing
+  the host with other services"); an idle runner on a host that runs short is
+  deregistered and logged as `host-memory`. A VM the kernel OOM-kills, because it
   passed its slot's `MemoryMax` or the fleet passed the slice's, is logged as
   `oom-killed` and deregistered. The unit keeps running (`OOMPolicy=continue`)
   and the slot starts a fresh VM.
@@ -618,5 +659,6 @@ fleet accounting are checked against a fixture cgroup tree via
 | `/var/lib/gha-vm/run/.slot-<n>.wait` | the slot is waiting for fleet memory, since this epoch |
 | `/var/lib/gha-vm/run/.slot-<n>.claim` | memory a just-started VM may still grow into, counted for 5 min |
 | `/etc/systemd/system/ghavm.slice` | the fleet's shared memory ceiling (`FLEET_MEM`) |
+| `/etc/systemd/system/gha-vm-memguard.service` | lowers that ceiling live while the host is short (`HOST_MEM_FLOOR`) |
 | `/etc/systemd/system/gha-vm@<n>.service.d/50-gha-vm-size.conf` | per-slot `MemoryMax` from `VM_MEM_<n>` |
 | `/etc/systemd/zram-generator.conf` | zram swap (`HOST_ZRAM`), written only when absent or ours |

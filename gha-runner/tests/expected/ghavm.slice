@@ -6,3 +6,4 @@ Before=slices.target
 MemoryAccounting=yes
 MemoryHigh=24576M
 MemoryMax=26624M
+MemorySwapMax=3072M
