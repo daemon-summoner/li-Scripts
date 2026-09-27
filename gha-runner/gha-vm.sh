@@ -721,11 +721,24 @@ HOST_SHED_SEC=30
 
 wait_flag() { printf '%s/.slot-%s.wait' "$RUN_DIR" "$1"; }
 
+# Whether a VM of $1 MiB would be admitted under a live budget of $2 MiB
+# (empty: none) once every running VM had exited and given its memory back.
+fleet_could_fit() {
+	local need="$1" budget="$2" floor
+	[[ -n "$budget" ]] && ((need > budget)) && return 1
+	floor="$(host_floor_mb)"
+	((floor > 0)) || return 0
+	((need <= $(meminfo_mb MemAvailable) + $(fleet_resident_mb) - floor))
+}
+
 # The earliest-waiting live slot other than $1 that queued before $2 (epoch
-# seconds; ties go to the lower slot). Empty when $1 is at the head. A wait
-# file whose supervisor is gone is ignored: it died without cleaning up.
+# seconds; ties go to the lower slot), under a live budget of $3 MiB. Empty
+# when $1 is at the head. A wait file whose supervisor is gone is ignored: it
+# died without cleaning up. So is a waiter too big for the fleet even emptied
+# (memguard holding the budget low, the host short): others running would not
+# be what keeps it out, and holding them back would leave no runner at all.
 fleet_waiter_ahead() {
-	local slot="$1" since="$2" f k ts best="" best_ts=""
+	local slot="$1" since="$2" budget="$3" f k ts best="" best_ts=""
 	for f in "$RUN_DIR"/.slot-*.wait; do
 		[[ -r "$f" ]] || continue
 		k="${f##*/.slot-}"
@@ -735,6 +748,7 @@ fleet_waiter_ahead() {
 		[[ "$ts" =~ ^[0-9]+$ ]] || continue
 		((ts < since || (ts == since && k < slot))) || continue
 		slot_is_live "$k" || continue
+		fleet_could_fit "$(slot_mem_mb "$k")" "$budget" || continue
 		if [[ -z "$best" ]] || ((ts < best_ts || (ts == best_ts && k < best))); then
 			best="$k"
 			best_ts="$ts"
@@ -748,7 +762,7 @@ fleet_waiter_ahead() {
 # Empty means go.
 fleet_block_reason() {
 	local slot="$1" need="$2" since="$3" budget="$4" ahead used claims
-	ahead="$(fleet_waiter_ahead "$slot" "$since")"
+	ahead="$(fleet_waiter_ahead "$slot" "$since" "$budget")"
 	if [[ -n "$ahead" ]]; then
 		printf 'queued behind slot %s' "$ahead"
 		return 0

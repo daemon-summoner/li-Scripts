@@ -219,6 +219,26 @@ $verify_out"
 	host_mem 13000 0.00
 	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
 	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s$' <<<"$fo" || fail "13000M available fits 8192M above the 4800M floor: $fo"
+
+	# A head waiter that could not start even with the fleet emptied does
+	# not hold back a smaller slot that fits: bigger than the live budget,
+	# or bigger than the host could give it (14000M available + 8192M the
+	# fleet holds - 4800M floor = 17392M < 24576M).
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nVM_MEM_3=32G\nRUN_DIR='"$run"
+	host_mem 40000 0.00
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -Eq '^5 +8192M +0M +waiting 1[0-9]s$' <<<"$fo" || fail "slot 5 should not queue behind a slot 3 bigger than the budget: $fo"
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nVM_MEM_3=24G\nRUN_DIR='"$run"
+	host_mem 14000 0.00
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -Eq '^3 +24576M +0M +waiting 2[0-9]s: fleet holds' <<<"$fo" || fail "slot 3 should still wait for its own room: $fo"
+	grep -Eq '^5 +8192M +0M +waiting 1[0-9]s$' <<<"$fo" || fail "slot 5 should not queue behind a slot 3 the host cannot fit: $fo"
+	host_mem 40000 0.00
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -Eq '^5 +8192M +0M +waiting 1[0-9]s: queued behind slot 3$' <<<"$fo" ||
+		fail "slot 5 should queue behind a slot 3 that fits once the fleet drains: $fo"
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nRUN_DIR='"$run"
+	host_mem 13000 0.00
 	host_mem 40000 25.31
 	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
 	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: host memory pressure at 25% \(HOST_PSI_MAX=10\)$' <<<"$fo" ||
