@@ -25,6 +25,7 @@
 #   gha-vm.sh render            write units + ruleset to GHA_SYSTEMD_DIR/GHA_NFT_CONF
 #   gha-vm.sh run <slot>        supervisor loop for one slot (systemd entrypoint)
 #   gha-vm.sh netcheck          assert the isolation rules are loaded (ExecStartPre)
+#   gha-vm.sh memguard [--once] shrink the fleet's memory ceiling to what the host can spare
 #   gha-vm.sh reap | clean [--force]     cleanup
 #
 # Isolation model: the boundary is the VM, not a namespace. Inside the guest the
@@ -55,12 +56,15 @@ PROFILE_DIR="${GHA_PROFILE_DIR:-/etc/gha-vm/profiles}"
 UNIT="$SYSTEMD_DIR/gha-vm@.service"
 UPGRADE_UNIT="$SYSTEMD_DIR/gha-vm-upgrade.service"
 UPGRADE_TIMER="$SYSTEMD_DIR/gha-vm-upgrade.timer"
+MEMGUARD_UNIT="$SYSTEMD_DIR/gha-vm-memguard.service"
 # No dash in the name: systemd reads a dash as nesting, so gha-vm.slice would
 # live at gha.slice/gha-vm.slice and every cgroup path below would miss it.
 FLEET_SLICE="$SYSTEMD_DIR/ghavm.slice"
 # cgroup v2 mount; overridable so the fleet accounting can be read from a
 # fixture tree.
 CGROUP_ROOT="${GHA_CGROUP_ROOT:-/sys/fs/cgroup}"
+# Where meminfo and pressure/memory are read; overridable for fixtures.
+PROC_ROOT="${GHA_PROC_ROOT:-/proc}"
 
 # Guest prints this on the serial console once it is about to start the runner.
 # Absence of it inside BOOT_TIMEOUT means the VM never came up; kill it rather
@@ -192,6 +196,17 @@ apply_defaults() {
 	MEM_OVERCOMMIT_PCT="${MEM_OVERCOMMIT_PCT:-100}"
 	HOST_ZRAM="${HOST_ZRAM:-1}"
 	HOST_ZRAM_SIZE="${HOST_ZRAM_SIZE:-min(ram / 4, 8192)}"
+	# Host swap the fleet may fill: auto = 1/8 of the budget, max = no limit.
+	FLEET_SWAP_MAX="${FLEET_SWAP_MAX:-auto}"
+	[[ "$FLEET_SWAP_MAX" =~ ^[0-9]+$ ]] && FLEET_SWAP_MAX="${FLEET_SWAP_MAX}G"
+	# MemAvailable the runner VMs always leave to the rest of the host, however
+	# much budget is left: auto = the larger of 4G and a tenth of RAM, 0 = off.
+	HOST_MEM_FLOOR="${HOST_MEM_FLOOR:-auto}"
+	[[ "$HOST_MEM_FLOOR" =~ ^[0-9]+$ ]] && HOST_MEM_FLOOR="${HOST_MEM_FLOOR}G"
+	# Memory pressure (PSI "some" avg10, percent) at which no VM starts and
+	# idle runners are shed; 0 = ignore pressure.
+	HOST_PSI_MAX="${HOST_PSI_MAX:-10}"
+	MEMGUARD_INTERVAL="${MEMGUARD_INTERVAL:-5}"
 
 	RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,${RUNNER_ARCH},vm,ephemeral,docker}"
 	RUNNER_LABELS_APPEND_HOST="${RUNNER_LABELS_APPEND_HOST:-1}"
@@ -400,6 +415,12 @@ validate_sizing() {
 	[[ "$FLEET_MEM" =~ ^(auto|off)$ ]] || (($(mem_to_mb "$FLEET_MEM") > 0)) || die "FLEET_MEM must be above zero (got '$FLEET_MEM')"
 	[[ "$MEM_OVERCOMMIT_PCT" =~ ^[1-9][0-9]*$ ]] || die "MEM_OVERCOMMIT_PCT must be a positive whole percent (got '$MEM_OVERCOMMIT_PCT')"
 	[[ "$HOST_ZRAM" =~ ^[01]$ ]] || die "HOST_ZRAM must be 0 or 1 (got '$HOST_ZRAM')"
+	[[ "$FLEET_SWAP_MAX" =~ ^(auto|max|[0-9]+[MGmg])$ ]] || die "FLEET_SWAP_MAX must be auto, max, or a size like 2G (got '$FLEET_SWAP_MAX')"
+	[[ "$HOST_MEM_FLOOR" =~ ^(auto|[0-9]+[MGmg])$ ]] || die "HOST_MEM_FLOOR must be auto, 0, or a size like 6G (got '$HOST_MEM_FLOOR')"
+	if ! [[ "$HOST_PSI_MAX" =~ ^[0-9]+$ ]] || ((HOST_PSI_MAX > 100)); then
+		die "HOST_PSI_MAX must be a percent from 0 to 100 (got '$HOST_PSI_MAX')"
+	fi
+	[[ "$MEMGUARD_INTERVAL" =~ ^[1-9][0-9]*$ ]] || die "MEMGUARD_INTERVAL must be a positive number of seconds (got '$MEMGUARD_INTERVAL')"
 	local zre='^[a-z0-9 ()/*+,.-]+$'
 	[[ "$HOST_ZRAM_SIZE" =~ $zre ]] || die "HOST_ZRAM_SIZE must be a zram-generator size expression like 'min(ram / 4, 8192)' (got '$HOST_ZRAM_SIZE')"
 	validate_slot_classes
@@ -599,6 +620,105 @@ fleet_live_budget_mb() {
 	fleet_budget_mb
 }
 
+# The most the fleet may ever hold: MemoryHigh as `install` wrote it into
+# ghavm.slice, which memguard never raises the live limit past; the config
+# value when the slice is not installed. Empty when FLEET_MEM=off.
+fleet_cap_mb() {
+	[[ "$FLEET_MEM" == off ]] && return 0
+	local v=""
+	[[ -r "$FLEET_SLICE" ]] && v="$(sed -n 's/^MemoryHigh=\([0-9][0-9]*\)M$/\1/p' "$FLEET_SLICE")"
+	if [[ -n "$v" ]]; then
+		printf '%s' "$v"
+	else
+		fleet_budget_mb
+	fi
+}
+
+# Host swap the slice may use, in MiB; empty for no limit. Unbounded, a
+# throttled fleet pushes its guests' RAM into the swap every other service
+# depends on, and the disk behind it into IO wait.
+fleet_swap_max_mb() {
+	case "$FLEET_SWAP_MAX" in
+	max) return 0 ;;
+	auto) printf '%s' "$(($1 / 8))" ;;
+	*) mem_to_mb "$FLEET_SWAP_MAX" ;;
+	esac
+}
+
+# ------------------------------------------------------------ host memory ----
+#
+# The fleet budget is fixed at install time and blind to everything else on
+# the host. These checks read the host itself, so the fleet backs off when
+# another service grows: a slot starts only while MemAvailable stays above
+# HOST_MEM_FLOOR with its VM at full size and memory pressure is low, an idle
+# runner gives its memory back when either fails, and memguard lowers the
+# slice's live ceiling to what the host can spare.
+
+meminfo_mb() { awk -v k="$1:" '$1 == k { print int($2 / 1024); exit }' "$PROC_ROOT/meminfo"; }
+
+# HOST_MEM_FLOOR in MiB; 0 when off.
+host_floor_mb() {
+	local t
+	case "$HOST_MEM_FLOOR" in
+	auto)
+		t=$(($(meminfo_mb MemTotal) / 10))
+		((t < 4096)) && t=4096
+		printf '%s' "$t"
+		;;
+	*) mem_to_mb "$HOST_MEM_FLOOR" ;;
+	esac
+}
+
+# Memory PSI "some" avg10 as a whole percent. Empty on a kernel without PSI,
+# where the file is missing or refuses reads; the floor check still applies.
+host_psi() {
+	[[ -r "$PROC_ROOT/pressure/memory" ]] || return 0
+	awk '$1 == "some" { for (i = 2; i <= NF; i++) if (sub(/^avg10=/, "", $i)) { print int($i); exit } }' \
+		"$PROC_ROOT/pressure/memory" 2>/dev/null || return 0
+}
+
+host_psi_reason() {
+	local psi
+	((HOST_PSI_MAX > 0)) || return 0
+	psi="$(host_psi)"
+	[[ -n "$psi" ]] && ((psi >= HOST_PSI_MAX)) &&
+		printf 'host memory pressure at %s%% (HOST_PSI_MAX=%s)' "$psi" "$HOST_PSI_MAX"
+	return 0
+}
+
+# Why the host cannot take a VM of $1 MiB now, on top of $2 MiB that VMs
+# still starting will grow into. Empty means it can.
+host_block_reason() {
+	local need="$1" claims="$2" floor avail
+	floor="$(host_floor_mb)"
+	((floor > 0)) || return 0
+	avail="$(meminfo_mb MemAvailable)"
+	if ((avail - claims - need < floor)); then
+		printf 'host has %sM available' "$avail"
+		((claims > 0)) && printf ' (%sM of it promised to starting VMs)' "$claims"
+		printf '; this slot needs %sM and %sM stays free for other services' "$need" "$floor"
+		return 0
+	fi
+	host_psi_reason
+}
+
+# Why an idle runner should give its memory back now; empty when it need not.
+host_shed_reason() {
+	local floor avail
+	floor="$(host_floor_mb)"
+	((floor > 0)) || return 0
+	avail="$(meminfo_mb MemAvailable)"
+	if ((avail < floor)); then
+		printf 'host has %sM available, under the %sM floor' "$avail" "$floor"
+		return 0
+	fi
+	host_psi_reason
+}
+
+# An idle runner is shed only after the host has stayed short this long, so
+# a brief spike does not throw away a booted VM.
+HOST_SHED_SEC=30
+
 wait_flag() { printf '%s/.slot-%s.wait' "$RUN_DIR" "$1"; }
 
 # The earliest-waiting live slot other than $1 that queued before $2 (epoch
@@ -624,19 +744,24 @@ fleet_waiter_ahead() {
 }
 
 # Why slot $1 (needing $2 MiB, queued at $3) may not register a runner now
-# under a budget of $4 MiB. Empty means go.
+# under a budget of $4 MiB (empty: no fleet budget, host checks only).
+# Empty means go.
 fleet_block_reason() {
-	local slot="$1" need="$2" since="$3" budget="$4" ahead used
-	[[ -n "$budget" ]] || return 0
+	local slot="$1" need="$2" since="$3" budget="$4" ahead used claims
 	ahead="$(fleet_waiter_ahead "$slot" "$since")"
 	if [[ -n "$ahead" ]]; then
 		printf 'queued behind slot %s' "$ahead"
 		return 0
 	fi
-	used=$(($(fleet_used_mb) + $(fleet_claims_mb "$slot")))
-	((used + need > budget)) &&
-		printf 'fleet holds %sM of %sM; this slot needs %sM free' "$used" "$budget" "$need"
-	return 0
+	claims="$(fleet_claims_mb "$slot")"
+	if [[ -n "$budget" ]]; then
+		used=$(($(fleet_used_mb) + claims))
+		if ((used + need > budget)); then
+			printf 'fleet holds %sM of %sM; this slot needs %sM free' "$used" "$budget" "$need"
+			return 0
+		fi
+	fi
+	host_block_reason "$need" "$claims"
 }
 
 # Blocks until slot $1 may register a runner for a VM of $2 MiB, then claims
@@ -645,9 +770,10 @@ fleet_block_reason() {
 # under one fleet-wide lock (fd 8, held only for the check) so two slots
 # cannot both read the same free memory and both start.
 fleet_admit() {
-	local slot="$1" need="$2" budget wf since reason last="" lock="$RUN_DIR/.fleet-admit.lock"
+	local slot="$1" need="$2" budget floor wf since reason last="" lock="$RUN_DIR/.fleet-admit.lock"
 	budget="$(fleet_live_budget_mb)"
-	[[ -n "$budget" ]] || return 0
+	floor="$(host_floor_mb)"
+	[[ -n "$budget" ]] || ((floor > 0)) || return 0
 	wf="$(wait_flag "$slot")"
 	since=$(date +%s)
 	printf '%s\n' "$since" >"$wf"
@@ -671,7 +797,7 @@ fleet_admit() {
 		last="$reason"
 		nap 10
 		budget="$(fleet_live_budget_mb)"
-		if [[ -z "$budget" ]]; then
+		if [[ -z "$budget" ]] && ((floor == 0)); then
 			rm -f "$wf"
 			return 0
 		fi
@@ -689,6 +815,101 @@ own_oom_kills() {
 	f="$CGROUP_ROOT${cg}/memory.events"
 	[[ -n "$cg" && -r "$f" ]] || return 0
 	awk '$1 == "oom_kill" { print $2; exit }' "$f"
+}
+
+# ------------------------------------------------------------- memguard ----
+#
+# Admission only decides whether a VM may start; a running job still grows.
+# memguard (root, gha-vm-memguard.service) moves ghavm.slice's live limits
+# every MEMGUARD_INTERVAL seconds: MemoryHigh to what the fleet holds in
+# anonymous memory plus the host's MemAvailable above HOST_MEM_FLOOR, never
+# past the installed ceiling, and MemoryMax the usual margin above it. When
+# another service grows, the fleet is throttled and, past MemoryMax, loses a
+# VM to the OOM killer instead of the host thrashing. As memory frees up the
+# limits rise back to the ceiling. The files are written directly: a systemd
+# property per tick would pile up runtime drop-ins, and a daemon-reload that
+# restores the installed values is corrected on the next tick.
+
+# Least MemoryHigh memguard sets. Near zero the guests would freeze outright
+# rather than be throttled or killed.
+MEMGUARD_MIN_MB=1024
+
+# MiB the fleet may hold now under a ceiling of $1 MiB.
+memguard_target_mb() {
+	local cap="$1" d="$CGROUP_ROOT/ghavm.slice" cur file t
+	cur="$(<"$d/memory.current")"
+	file="$(awk '$1 == "file" { print $2; exit }' "$d/memory.stat")"
+	t=$(((cur - ${file:-0}) / 1048576 + $(meminfo_mb MemAvailable) - $(host_floor_mb)))
+	((t > cap)) && t=$cap
+	((t < MEMGUARD_MIN_MB)) && t=$MEMGUARD_MIN_MB
+	printf '%s' "$t"
+}
+
+memguard_write() { # high_mb max_mb
+	local d="$CGROUP_ROOT/ghavm.slice"
+	printf '%s\n' "$(($1 * 1048576))" >"$d/memory.high"
+	printf '%s\n' "$(($2 * 1048576))" >"$d/memory.max"
+}
+
+# One adjustment. Writes only when the live MemoryHigh is off the target by
+# MEMGUARD_STEP_MB, so the limits do not chase every page the host touches.
+MEMGUARD_STEP_MB=256
+_MEMGUARD_LOGGED=""
+memguard_tick() {
+	local d="$CGROUP_ROOT/ghavm.slice" cap target live="" diff
+	cap="$(fleet_cap_mb)"
+	[[ -n "$cap" && -r "$d/memory.high" ]] || return 0
+	target="$(memguard_target_mb "$cap")"
+	live="$(<"$d/memory.high")"
+	if [[ "$live" =~ ^[0-9]+$ ]]; then
+		diff=$((live / 1048576 - target))
+		((diff < 0)) && diff=$((-diff))
+		((diff < MEMGUARD_STEP_MB)) && return 0
+	fi
+	memguard_write "$target" "$((target + $(fleet_slack_mb "$cap")))"
+	if ((target == cap)); then
+		[[ -n "$_MEMGUARD_LOGGED" && "$_MEMGUARD_LOGGED" != "$cap" ]] &&
+			log "memguard: host has room again; fleet ceiling back at ${cap}M"
+	elif [[ -z "$_MEMGUARD_LOGGED" ]] || ((_MEMGUARD_LOGGED - target >= 1024 || target - _MEMGUARD_LOGGED >= 1024)); then
+		log "memguard: fleet ceiling ${target}M of ${cap}M; host has $(meminfo_mb MemAvailable)M available, keeps $(host_floor_mb)M"
+	else
+		return 0
+	fi
+	_MEMGUARD_LOGGED="$target"
+}
+
+# Stopping hands the fleet its installed limits back: a guard that is gone
+# must not leave the fleet pinned at a low it can no longer lift.
+memguard_restore() {
+	local c
+	c="$(fleet_cap_mb)"
+	[[ -n "$c" && -w "$CGROUP_ROOT/ghavm.slice/memory.high" ]] &&
+		memguard_write "$c" "$((c + $(fleet_slack_mb "$c")))"
+	log "memguard: stopped; fleet ceiling restored to ${c}M"
+	exit 0
+}
+
+cmd_memguard() {
+	[[ $EUID -eq 0 ]] || die "memguard must run as root"
+	local cap floor
+	cap="$(fleet_cap_mb)"
+	floor="$(host_floor_mb)"
+	[[ -n "$cap" ]] || die "memguard needs a fleet ceiling; FLEET_MEM=off"
+	((floor > 0)) || die "memguard needs a host floor; HOST_MEM_FLOOR=0"
+	[[ -r "$CGROUP_ROOT/cgroup.controllers" ]] || die "memguard needs cgroup v2 at $CGROUP_ROOT"
+	if [[ "${1:-}" == --once ]]; then
+		_MEMGUARD_LOGGED="$cap"
+		memguard_tick
+		return 0
+	fi
+	[[ -z "${1:-}" ]] || die "usage: $SELF memguard [--once]"
+	trap memguard_restore INT TERM
+	log "memguard: fleet ceiling ${cap}M; keeping ${floor}M available to the host"
+	_MEMGUARD_LOGGED="$cap"
+	while :; do
+		memguard_tick
+		nap "$MEMGUARD_INTERVAL"
+	done
 }
 
 # ------------------------------------------------------------------ auth ----
@@ -2397,10 +2618,11 @@ cmd_run() {
 	apply_slot_class "$slot"
 
 	# Checked before taking the lock so a misfit slot fails with the reason
-	# instead of queueing forever behind a budget it can never fit.
+	# instead of queueing forever behind a budget it can never fit. Against
+	# the installed ceiling: memguard may hold the live one lower for a while.
 	local need budget
 	need="$(mem_to_mb "$VM_MEM")"
-	budget="$(fleet_live_budget_mb)"
+	budget="$(fleet_cap_mb)"
 	if [[ -n "$budget" ]]; then
 		[[ -r "$CGROUP_ROOT/cgroup.controllers" ]] ||
 			die "slot $slot: FLEET_MEM needs cgroup v2 at $CGROUP_ROOT (or set FLEET_MEM=off)"
@@ -2598,7 +2820,7 @@ cmd_run() {
 		"$QEMU_BIN" "${QEMU_ARGS[@]}" 9>&- &
 		vmpid=$!
 
-		local reason="" now elapsed
+		local reason="" now elapsed short short_since=0
 		ready=0
 		while kill -0 "$vmpid" 2>/dev/null; do
 			nap 5
@@ -2607,6 +2829,25 @@ cmd_run() {
 			if ((ready == 0)) && grep -qF "$READY_MARKER" "$dir/console.log" 2>/dev/null; then
 				ready=1
 				log "slot $slot: $name up after ${elapsed}s"
+			fi
+			# An idle runner on a host that has run short gives its memory
+			# back and queues for admission again. It is deregistered first:
+			# GitHub refuses to delete a runner that has taken a job, so a
+			# successful delete means no job can land on the VM being killed.
+			short=""
+			((ready)) && ! vm_has_job "$dir" && short="$(host_shed_reason)"
+			if [[ -z "$short" ]]; then
+				short_since=0
+			elif ((short_since == 0)); then
+				short_since=$now
+			elif ((now - short_since >= HOST_SHED_SEC)); then
+				if API_MAXTIME=10 API_RETRY=0 reap_one "$name"; then
+					log "slot $slot: shedding idle $name: $short"
+					reason="host-memory"
+					break
+				fi
+				log "slot $slot: WARN could not deregister idle $name to shed it; retrying in ${HOST_SHED_SEC}s"
+				short_since=$now
 			fi
 			if ((ready == 0 && elapsed > BOOT_TIMEOUT)); then
 				reason="boot-timeout"
@@ -3387,7 +3628,8 @@ cmd_doctor() {
 		# preflight setup.sh and bootstrap run before that install.
 		elif [[ ! -e "$FLEET_SLICE" ]]; then
 			echo "WARN: ghavm.slice not installed yet (run: $SELF install, then: $SELF restart all)"
-		elif [[ "$live" =~ ^[0-9]+$ ]] && ! fleet_budget_close "$((live / 1048576))" "$budget"; then
+		elif [[ "$live" =~ ^[0-9]+$ ]] && ! fleet_budget_close "$((live / 1048576))" "$budget" &&
+			! memguard_holding "$((live / 1048576))" "$budget"; then
 			echo "WARN: ghavm.slice enforces $((live / 1048576))M, config says ${budget}M (run: $SELF install)"
 		elif [[ -n "$live" && ! "$live" =~ ^[0-9]+$ ]]; then
 			echo "WARN: ghavm.slice has no memory limit, config says ${budget}M (run: $SELF install)"
@@ -3396,6 +3638,18 @@ cmd_doctor() {
 		else
 			echo "OK (${budget}M shared, $(fleet_used_mb)M in use; see: $SELF fleet)"
 		fi
+	fi
+
+	printf 'host memory: '
+	local floor psi
+	floor="$(host_floor_mb)"
+	psi="$(host_psi)"
+	if ((floor == 0)); then
+		echo "unguarded (HOST_MEM_FLOOR=0: slots start and keep running whatever the rest of the host needs)"
+	elif [[ -n "$budget" ]] && ! systemctl is-active --quiet gha-vm-memguard.service 2>/dev/null; then
+		echo "WARN: gha-vm-memguard.service is not running, so running jobs do not back off when the host runs short (run: $SELF install)"
+	else
+		echo "OK ($(meminfo_mb MemAvailable)M available, ${floor}M kept for other services, pressure ${psi:-n/a}%)"
 	fi
 
 	printf 'swap: '
@@ -3420,20 +3674,31 @@ cmd_doctor() {
 # The fleet's shared memory: budget, what the slot units hold, and per slot
 # its size, use and whether it is running a VM or waiting for room.
 cmd_fleet() {
-	local budget src r sw claims n f k st since reason vm
+	local budget="" cap src r sw claims n f k st since reason vm floor psi
 	if [[ "$FLEET_MEM" == off ]]; then
 		printf 'budget     off  (FLEET_MEM=off: no shared ceiling, no admission wait)\n'
 	else
 		budget="$(fleet_live_budget_mb)"
+		cap="$(fleet_cap_mb)"
 		src="config FLEET_MEM=$FLEET_MEM; ghavm.slice not active"
 		[[ -r "$CGROUP_ROOT/ghavm.slice/memory.high" ]] && src="ghavm.slice MemoryHigh"
+		((budget < cap)) && src+="; memguard lowered it from ${cap}M for the rest of the host"
 		printf 'budget     %sM  (%s)\n' "$budget" "$src"
 	fi
 	read -r r sw <<<"$(fleet_mem_usage)"
 	claims="$(fleet_claims_mb)"
 	printf 'in use     %sM  (%sM resident + %sM swapped; page cache not counted)\n' "$((r + sw))" "$r" "$sw"
 	((claims > 0)) && printf 'claimed    %sM  (VMs started in the last %ss, not yet at full size)\n' "$claims" "$FLEET_CLAIM_SEC"
-	[[ -n "${budget:-}" ]] && printf 'free       %sM\n' "$((budget - r - sw - claims))"
+	[[ -n "$budget" ]] && printf 'free       %sM\n' "$((budget - r - sw - claims))"
+	floor="$(host_floor_mb)"
+	if ((floor > 0)); then
+		psi="$(host_psi)"
+		[[ -n "$psi" ]] && psi+="%"
+		printf 'host       %sM available, %sM kept for other services, pressure %s (limit %s%%)\n' \
+			"$(meminfo_mb MemAvailable)" "$floor" "${psi:-n/a}" "$HOST_PSI_MAX"
+	else
+		printf 'host       unguarded (HOST_MEM_FLOOR=0)\n'
+	fi
 
 	local slots=()
 	mapfile -t slots < <(
@@ -3464,9 +3729,7 @@ cmd_fleet() {
 		elif [[ -r "$(wait_flag "$n")" ]]; then
 			since="$(<"$(wait_flag "$n")")"
 			[[ "$since" =~ ^[0-9]+$ ]] || since=$(date +%s)
-			reason=""
-			[[ -n "${budget:-}" ]] &&
-				reason="$(fleet_block_reason "$n" "$(slot_mem_mb "$n")" "$since" "$budget")"
+			reason="$(fleet_block_reason "$n" "$(slot_mem_mb "$n")" "$since" "$budget")"
 			st="waiting $(($(date +%s) - since))s${reason:+: $reason}"
 		elif [[ -n "$vm" ]] && vm_has_job "$RUN_DIR/$vm"; then
 			st="busy $vm"
@@ -3571,6 +3834,9 @@ UMask=0077
 Slice=ghavm.slice
 MemoryMax=$((mem_mb + 2048))M
 OOMPolicy=continue
+# If the host as a whole runs out, the kernel kills a runner VM before any of
+# the services this host exists for.
+OOMScoreAdjust=500
 CPUWeight=50
 IOWeight=50
 
@@ -3635,20 +3901,70 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+	memguard_unit_render
 	slice_render
 	slot_dropins_render
 }
+
+# Root, because it writes ghavm.slice's limits; nothing else. It has no
+# network, no devices and no capabilities, and must outlast the pressure it
+# relieves, so the OOM killer passes it over.
+memguard_unit_render() {
+	cat >"$MEMGUARD_UNIT" <<EOF
+[Unit]
+Description=Shrink the gha-vm fleet's memory ceiling to what the host can spare
+ConditionPathExists=${CONFIG}
+
+[Service]
+Type=simple
+Environment=GHA_CONFIG=${CONFIG}
+EnvironmentFile=-$(dirname "$CONFIG")/env
+ExecStart=${LIBEXEC}/gha-vm.sh memguard
+Restart=always
+RestartSec=5
+SyslogIdentifier=gha-vm-memguard
+OOMScoreAdjust=-900
+MemoryMin=64M
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# Whether this host runs memguard: it needs both a ceiling to move and a floor.
+memguard_wanted() { [[ -n "$(fleet_budget_mb)" ]] && (($(host_floor_mb) > 0)); }
 
 # ghavm.slice: the fleet's shared memory ceiling. MemoryHigh is where the
 # kernel starts reclaiming and swapping inside the slice, so a fleet that
 # outgrows the budget slows down instead of starving the host; MemoryMax, a
 # margin above for QEMU's own overhead, is where it OOM-kills a VM.
+# MemorySwapMax keeps that swapping to the fleet's share of host swap.
 slice_render() {
-	local budget limits=""
+	local budget limits="" swap
 	budget="$(fleet_budget_mb)"
 	if [[ -n "$budget" ]]; then
 		((budget > 0)) || die "FLEET_MEM=auto leaves no memory: RAM is not above HOST_RESERVE_GB=${HOST_RESERVE_GB}G"
 		limits=$'\n'"MemoryHigh=${budget}M"$'\n'"MemoryMax=$((budget + $(fleet_slack_mb "$budget")))M"
+		swap="$(fleet_swap_max_mb "$budget")"
+		[[ -n "$swap" ]] && limits+=$'\n'"MemorySwapMax=${swap}M"
 	fi
 	cat >"$FLEET_SLICE" <<EOF
 [Unit]
@@ -3700,7 +4016,7 @@ cmd_render() {
 	validate_sizing
 	unit_render
 	net_write
-	log "rendered $UNIT $FLEET_SLICE $UPGRADE_UNIT $UPGRADE_TIMER $NFT_CONF $(slot_dropin_paths | paste -sd' ' -)"
+	log "rendered $UNIT $FLEET_SLICE $UPGRADE_UNIT $UPGRADE_TIMER $MEMGUARD_UNIT $NFT_CONF $(slot_dropin_paths | paste -sd' ' -)"
 }
 
 # Refuses an install whose fleet memory setup could never work: no cgroup v2
@@ -3730,6 +4046,15 @@ enabled_slots() {
 	done | sort -nu
 }
 
+# Whether a live MemoryHigh of $1 MiB below budget $2 is memguard's doing:
+# the guard is running and the installed ceiling still matches the budget.
+memguard_holding() {
+	local cap
+	systemctl is-active --quiet gha-vm-memguard.service 2>/dev/null || return 1
+	cap="$(fleet_cap_mb)"
+	(($1 <= cap)) && fleet_budget_close "$cap" "$2"
+}
+
 # Whether the slice's live MemoryHigh ($1 MiB) still matches the budget ($2
 # MiB). With FLEET_MEM=auto the budget follows autotune, which moves with
 # what else is resident, so drift within AUTOTUNE_HEADROOM_GB is not stale.
@@ -3744,13 +4069,15 @@ fleet_budget_close() {
 # run's --runtime values outrank the unit file until reboot; setting them
 # every time keeps admission, the file and the kernel in agreement.
 fleet_apply_live() {
-	local budget high=infinity max=infinity
+	local budget high=infinity max=infinity swap=""
 	budget="$(fleet_budget_mb)"
 	if [[ -n "$budget" ]]; then
 		high="${budget}M"
 		max="$((budget + $(fleet_slack_mb "$budget")))M"
+		swap="$(fleet_swap_max_mb "$budget")"
 	fi
-	systemctl set-property --runtime ghavm.slice "MemoryHigh=$high" "MemoryMax=$max" ||
+	[[ -n "$swap" ]] && swap="${swap}M"
+	systemctl set-property --runtime ghavm.slice "MemoryHigh=$high" "MemoryMax=$max" "MemorySwapMax=${swap:-infinity}" ||
 		die "could not apply the fleet memory limits to the running ghavm.slice"
 }
 
@@ -3835,6 +4162,17 @@ cmd_install() {
 	done
 	systemctl enable --now gha-vm-upgrade.timer >/dev/null 2>&1 ||
 		log "WARN: could not enable gha-vm-upgrade.timer; the golden image will not refresh itself"
+	# Restarted, not just started: a running guard would keep the old script
+	# and the old ceiling.
+	if memguard_wanted; then
+		systemctl enable gha-vm-memguard.service >/dev/null 2>&1 ||
+			die "could not enable gha-vm-memguard.service"
+		systemctl restart gha-vm-memguard.service ||
+			die "could not start gha-vm-memguard.service; the fleet would not back off when the host runs short (see: journalctl -u gha-vm-memguard)"
+	else
+		systemctl disable --now gha-vm-memguard.service >/dev/null 2>&1 ||
+			log "WARN: could not disable gha-vm-memguard.service"
+	fi
 
 	log "installed $count slots; logs: journalctl -fu 'gha-vm@*'"
 	if ((was_active)); then
@@ -3853,7 +4191,9 @@ cmd_uninstall() {
 	done < <(systemctl list-units --no-legend --all 'gha-vm@*.service' 2>/dev/null | awk '{print $1}')
 	systemctl disable --now gha-vm-upgrade.timer >/dev/null 2>&1 ||
 		log "WARN: could not disable gha-vm-upgrade.timer"
-	rm -f "$UNIT" "$UPGRADE_UNIT" "$UPGRADE_TIMER" "$FLEET_SLICE" \
+	systemctl disable --now gha-vm-memguard.service >/dev/null 2>&1 ||
+		log "WARN: could not disable gha-vm-memguard.service"
+	rm -f "$UNIT" "$UPGRADE_UNIT" "$UPGRADE_TIMER" "$MEMGUARD_UNIT" "$FLEET_SLICE" \
 		"$RUN_DIR"/.slot-*.drain "$RUN_DIR"/.slot-*.wait "$RUN_DIR"/.slot-*.claim "$RUN_DIR"/.fleet-admit.lock
 	# Runtime limits from fleet_apply_live; they would outlive the slice file.
 	rm -rf /run/systemd/system.control/ghavm.slice.d
@@ -3883,6 +4223,7 @@ CONFIG_KEYS=(
 	MAX_LIFETIME BOOT_TIMEOUT MIN_FREE_GB
 	STOP_GRACE_SEC REAP_ON_STOP REAP_INTERVAL JIT_BACKOFF_MAX CLOCK_SYNC_WAIT
 	HOST_RESERVE_GB CPU_OVERCOMMIT DISK_PER_SLOT_GB FLEET_MEM MEM_OVERCOMMIT_PCT HOST_ZRAM HOST_ZRAM_SIZE
+	FLEET_SWAP_MAX HOST_MEM_FLOOR HOST_PSI_MAX MEMGUARD_INTERVAL
 	RUNNER_VERSION RUNNER_SHA256 RUNNER_LABELS RUNNER_LABELS_APPEND_HOST RUNNER_GROUP_ID RUNNER_GROUP NAME_PREFIX
 	ALLOW_UNVERIFIED_RUNNER AUTO_RUNNER_VERSION UPGRADE_REBUILD SPARSIFY
 	APT_LOCK_WAIT APT_LOCK_TRIES REQUIRE_ISOLATION
@@ -3988,6 +4329,11 @@ main() {
 	netcheck)
 		load_config
 		cmd_netcheck
+		;;
+	memguard)
+		load_config_optional
+		validate_sizing
+		cmd_memguard "$@"
 		;;
 	drain)
 		load_config
