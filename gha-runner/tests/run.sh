@@ -306,6 +306,118 @@ $verify_out"
 	unset GHA_PROC_ROOT
 	pass "memguard follows the host, keeps its step, caps, floors, and restores on stop"
 
+	# On-demand slots: a fake curl serves GitHub's Actions API from fixture
+	# files keyed by request path, with etags, so the queue walk, the label
+	# match and the 304 revalidation run against the real parsing code.
+	local dm=$fl/demand
+	install -d "$dm/bin" "$dm/api" "$dm/run"
+	cat >"$dm/bin/curl" <<SH
+#!/bin/bash
+cat >/dev/null
+hdr="" url="" inm=""
+while ((\$#)); do
+	case "\$1" in
+	-D) hdr="\$2"; shift ;;
+	-H) [[ "\$2" == If-None-Match:* ]] && inm="\${2#If-None-Match: }"; shift ;;
+	-w | -X | -d | --max-time | --retry | --retry-delay | --proto | --connect-timeout) shift ;;
+	https://*) url="\$1" ;;
+	esac
+	shift
+done
+path="\${url#https://api.github.com}"
+echo "\$path\${inm:+ inm}" >>"$dm/log"
+f="$dm/api/\$(printf '%s' "\$path" | sha256sum | cut -c1-16)"
+[[ -e "\$f" ]] || { printf '{"message":"Not Found"}\n404'; exit 0; }
+code=200
+[[ -e "\$f.code" ]] && code="\$(<"\$f.code")"
+etag="\"\$(sha256sum "\$f" | cut -c1-12)\""
+[[ -n "\$hdr" ]] && printf 'HTTP/2 %s\r\netag: %s\r\n\r\n' "\$code" "\$etag" >"\$hdr"
+[[ "\$code" == 200 && "\$inm" == "\$etag" ]] && { printf '\n304'; exit 0; }
+cat "\$f"
+printf '\n%s' "\$code"
+SH
+	chmod +x "$dm/bin/curl"
+	gh_api() { printf '%s' "$2" >"$dm/api/$(printf '%s' "$1" | sha256sum | cut -c1-16)"; }
+	gh_api '/orgs/example-org/repos?type=all&per_page=100&page=1' \
+		'[{"full_name":"example-org/a","archived":false},{"full_name":"example-org/old","archived":true}]'
+	gh_api '/repos/example-org/a/actions/runs?status=queued&per_page=100' '{"workflow_runs":[{"id":7}]}'
+	gh_api '/repos/example-org/a/actions/runs?status=in_progress&per_page=100' \
+		'{"workflow_runs":[{"id":8,"updated_at":"2026-01-01T00:00:00Z"}]}'
+	gh_api '/repos/example-org/a/actions/runs/7/jobs?filter=latest&per_page=100' \
+		'{"jobs":[{"id":70,"status":"queued","labels":["self-hosted","linux"]}]}'
+	gh_api '/repos/example-org/a/actions/runs/8/jobs?filter=latest&per_page=100' \
+		'{"jobs":[{"id":80,"status":"in_progress","labels":["self-hosted","large"]},{"id":81,"status":"queued","labels":["self-hosted","large","gpu"]}]}'
+	local dcfg=$'FLEET_MEM=24G\nVM_MEM_1=16G\nRUNNER_LABELS_EXTRA_1=large\nON_DEMAND_1=1\nAUTH_MODE=pat\nGITHUB_PAT=test\nRUNNER_LABELS_APPEND_HOST=0\nRUN_DIR='"$dm/run"
+	fleet_env <<<"$dcfg"
+	dm_run() {
+		chmod 0640 "$fl/cfg.env"
+		PATH="$dm/bin:$PATH" GHA_CONFIG=$fl/cfg.env GHA_DEMAND_CACHE=$dm/run/.demand-cache "$gha" demand 2>&1
+	}
+	local dout
+	dout="$(dm_run)" || fail "demand exited non-zero: $dout"
+	[[ "$dout" == "slot 1: idle; no queued job asks for large" ]] ||
+		fail "a job for any runner, a running one and one needing a label the slot lacks must not start it: $dout"
+	grep -q '/repos/example-org/old/' "$dm/log" && fail "demand walked an archived repo"
+	gh_api '/repos/example-org/a/actions/runs/8/jobs?filter=latest&per_page=100' \
+		'{"jobs":[{"id":80,"status":"in_progress","labels":["self-hosted","large"]},{"id":82,"status":"queued","labels":["self-hosted","Large"]}]}'
+	: >"$dm/log"
+	dout="$(dm_run)" || fail "demand exited non-zero: $dout"
+	[[ "$dout" == "slot 1: idle; no queued job asks for large" ]] ||
+		fail "jobs of a run whose updated_at did not move should come from the cache: $dout"
+	grep -q '/runs/8/jobs' "$dm/log" && fail "demand refetched the jobs of an unchanged run: $(<"$dm/log")"
+	gh_api '/repos/example-org/a/actions/runs?status=in_progress&per_page=100' \
+		'{"workflow_runs":[{"id":8,"updated_at":"2026-01-01T00:01:00Z"}]}'
+	: >"$dm/log"
+	dout="$(dm_run)" || fail "demand exited non-zero: $dout"
+	[[ "$dout" == "slot 1: wanted by job 82 in example-org/a" ]] || fail "a queued job asking for large should start slot 1: $dout"
+	grep -q '^/repos/example-org/a/actions/runs?status=queued&per_page=100 inm$' "$dm/log" ||
+		fail "demand did not revalidate its cached listing: $(<"$dm/log")"
+	: >"$dm/log"
+	dout="$(dm_run)" || fail "demand exited non-zero: $dout"
+	[[ "$dout" == "slot 1: wanted by job 82 in example-org/a" ]] || fail "a 304 should answer from the cached listing: $dout"
+	fleet_env <<<"${dcfg/RUN_DIR=$dm\/run/RUN_DIR=$dm/fresh}"
+	chmod 0640 "$fl/cfg.env"
+	dout="$(PATH="$dm/bin:$PATH" GHA_CONFIG=$fl/cfg.env "$gha" demand 2>&1)" || fail "demand as root exited non-zero: $dout"
+	[[ ! -e "$dm/fresh" ]] || fail "demand run as root created RUN_DIR (and a root-owned cache) the supervisors need to own"
+	fleet_env <<<"$dcfg"
+	chmod 0640 "$fl/cfg.env"
+	dout="$(PATH="$dm/bin:$PATH" GHA_CONFIG=$fl/cfg.env "$gha" doctor 2>&1)" || :
+	grep -q '^queued-job access (on-demand slot 1): OK$' <<<"$dout" ||
+		fail "doctor did not pass a readable Actions queue: $(grep -A2 queued-job <<<"$dout")"
+	echo 502 >"$dm/api/$(printf '%s' '/repos/example-org/a/actions/runs?status=queued&per_page=100' | sha256sum | cut -c1-16).code"
+	dout="$(PATH="$dm/bin:$PATH" GHA_CONFIG=$fl/cfg.env "$gha" doctor 2>&1)" || :
+	grep -q '^queued-job access (on-demand slot 1): FAIL: the PAT needs Actions read' <<<"$dout" ||
+		fail "doctor did not flag an unreadable Actions queue: $(grep -A2 queued-job <<<"$dout")"
+	echo 502 >"$dm/api/$(printf '%s' '/repos/example-org/a/actions/runs?status=queued&per_page=100' | sha256sum | cut -c1-16).code"
+	if dout="$(dm_run)"; then fail "a failed listing read as an empty queue: $dout"; fi
+	grep -q 'could not read the Actions queue' <<<"$dout" || fail "a failed listing was not reported: $dout"
+	gh_api '/repos/example-org/b/actions/runs?status=queued&per_page=100' '{"workflow_runs":[]}'
+	gh_api '/repos/example-org/b/actions/runs?status=in_progress&per_page=100' '{"workflow_runs":[]}'
+	fleet_env <<<"$dcfg"$'\nDEMAND_REPOS=b'
+	: >"$dm/log"
+	dout="$(dm_run)" || fail "demand exited non-zero with DEMAND_REPOS: $dout"
+	[[ "$dout" == "slot 1: idle; no queued job asks for large" ]] || fail "DEMAND_REPOS=b should watch only b: $dout"
+	grep -qE '/orgs/|/repos/example-org/a/' "$dm/log" && fail "DEMAND_REPOS=b still listed other repos: $(<"$dm/log")"
+
+	: >"$dm/run/.slot-1.lock"
+	flock "$dm/run/.slot-1.lock" sleep 60 &
+	local dholder=$!
+	sleep 1
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$fl/cg "$gha" fleet)" || fail "fleet exited non-zero"
+	kill "$dholder"
+	wait "$dholder" || :
+	grep -Eq '^1 +16384M +[0-9]+M +on demand: no VM until a queued job asks for large$' <<<"$fo" ||
+		fail "fleet should show an idle on-demand slot: $fo"
+
+	fleet_env <<<$'FLEET_MEM=24G\nON_DEMAND_1=1\nAUTH_MODE=pat\nGITHUB_PAT=test'
+	if dout="$(dm_run)"; then fail "ON_DEMAND_1 without RUNNER_LABELS_EXTRA_1 accepted"; fi
+	grep -q 'ON_DEMAND_1 needs RUNNER_LABELS_EXTRA_1' <<<"$dout" || fail "wrong refusal for ON_DEMAND without labels: $dout"
+	fleet_env <<<"$dcfg"$'\nON_DEMAND_1=yes'
+	if dout="$(dm_run)"; then fail "ON_DEMAND_1=yes accepted"; fi
+	fleet_env <<<"$dcfg"$'\nDEMAND_POLL_SEC=0'
+	if dout="$(dm_run)"; then fail "DEMAND_POLL_SEC=0 accepted"; fi
+	pass "on-demand slots start only for a queued job asking for their labels"
+
 	# restart: an idle runner is not a running job. Slots 2 (idle) and 3 (a
 	# job's run dir left by a killed supervisor) restart at once, slot 1 once
 	# its job finishes, and a failed restart of slot 4 is reported without

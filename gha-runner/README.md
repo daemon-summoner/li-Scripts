@@ -37,12 +37,17 @@ takes about two minutes.
 1. **GitHub App name** — anything unique, e.g. `gha-vm-runners`.
 2. **Homepage URL** — required by the form but never used. Any URL.
 3. **Webhook** — untick **Active**. This app receives nothing.
-4. **Permissions** — exactly one, and it differs by scope:
+4. **Permissions** — one, and it differs by scope:
 
    | Scope | Permission | Level |
    |---|---|---|
    | org | Organization permissions → **Self-hosted runners** | Read and write |
    | repo | Repository permissions → **Administration** | Read and write |
+
+   With an on-demand slot (`ON_DEMAND_<n>=1`, see [On-demand slots](#on-demand-slots)),
+   also Repository permissions → **Actions** → Read-only, so the slot can see
+   queued jobs. The `services` profile has one. `sudo gha-vm doctor` checks it
+   (`queued-job access`).
 
    Leave everything else at *No access*. Getting this wrong is the most common
    failure: the app installs fine and then every token mint returns 422.
@@ -242,7 +247,9 @@ MEM_OVERCOMMIT_PCT=200        # capacity may plan 16G + 4 x 8G into 24G
 A slot registers a runner only when what the VMs really hold (resident memory
 and swap, not page cache) plus that slot's full size fits in the budget.
 Otherwise it waits, first come first served, and says why in the journal and in
-`gha-vm fleet`. Nothing is registered while it waits, so GitHub cannot hand it a
+`gha-vm fleet`. A waiting slot too big to start even if every running VM exited
+(larger than the live ceiling, or than the host can spare) does not hold back
+smaller slots that fit. Nothing is registered while it waits, so GitHub cannot hand it a
 job the host has no room for. A VM that has just started counts at its full size
 for 5 minutes, which stops several slots that free up together from all taking
 the same gap. Idle guests hand unused pages back through `virtio-balloon`
@@ -313,6 +320,55 @@ journalctl -u gha-vm-memguard         # every time the ceiling moves by 1 GB or 
 journalctl -u 'gha-vm@*' | grep shed  # idle runners given back
 ```
 
+### On-demand slots
+
+A big slot that boots and registers like the others holds its full size
+whether or not any job needs it. With `ON_DEMAND_<n>=1` the slot holds no VM
+and no runner until a queued job asks for one of its `RUNNER_LABELS_EXTRA_<n>`
+labels:
+
+```bash
+VM_MEM_1=16G
+RUNNER_LABELS_EXTRA_1=large   # runs-on: [self-hosted, large]
+ON_DEMAND_1=1
+```
+
+Every `DEMAND_POLL_SEC` (30) the slot lists the queued and in-progress workflow
+runs of the watched repos and looks for a queued job whose labels its runner
+would all carry, one of them from `RUNNER_LABELS_EXTRA_<n>`. A job without one
+of those labels never starts it. When it finds one, it queues for memory like
+any slot, boots, and registers; GitHub hands it the job. If the job goes
+elsewhere or is cancelled while the slot waits for memory, the slot goes back
+to idle. A booted VM that sits `DEMAND_IDLE_SEC` (180) without a job and with
+no other queued job for it is deregistered and stopped, and for the next hour
+the job it booted for does not start it again. That covers a job from a repo
+the runner group excludes, which would otherwise boot the VM over and over.
+
+The watched repos are every unarchived repo the credentials reach, or
+`DEMAND_REPOS` (comma-separated names) when set; in repo scope, the repo. Each
+poll lists the queued and in-progress runs of every watched repo with
+`If-None-Match`; GitHub does not count an unchanged listing (HTTP 304) against
+the rate limit. A run's jobs are fetched only when the run's `updated_at` moved,
+or every 5 minutes. On an org with many busy repos, set `DEMAND_REPOS` to the
+ones whose workflows ask for the on-demand label: every request shares the
+rate limit that registering runners also needs.
+
+A `large` job waits up to `DEMAND_POLL_SEC` plus the boot, about 15-30 s,
+longer than on a standing runner; one that becomes ready inside a run already
+in progress may be seen up to 5 minutes late if the run's `updated_at` did not
+move. While the VM is up, an
+older queued job for any runner may land on it first; the slot then boots again
+for the `large` job when that one finishes.
+
+The credentials need to read Actions: the app's Repository permissions →
+**Actions** → Read-only (accept the re-issued installation request), or a PAT
+with `repo` (classic) or Actions: read (fine-grained).
+
+```bash
+gha-vm demand     # which queued job each on-demand slot would start for now
+gha-vm fleet      # an idle one shows "on demand: no VM until a queued job asks for large"
+```
+
 ### The two plans
 
 | | dedicated CI box | `services` |
@@ -321,7 +377,7 @@ journalctl -u 'gha-vm@*' | grep shed  # idle runners given back
 | already resident | ~nothing | ~18 GB (llama-server, minio, clamd, containers) |
 | autotuned reserve | ~8 GB | ~23 GB |
 | per slot | 4 vCPU / 8 GB / 30 GB | 4 vCPU / 8 GB / 30 GB |
-| **slots** | **~15**, memory-bound | **5**, 16G + 4 × 8G at 200% of `FLEET_MEM=24G` |
+| **slots** | **~15**, memory-bound | **5**, 4 × 8G plus a 16G `large` slot booted on demand, at 200% of `FLEET_MEM=24G` |
 | profile file | none needed | `profiles/services.env` |
 
 The dedicated box needs no profile — autotune already lands on the right

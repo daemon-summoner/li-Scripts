@@ -26,6 +26,7 @@
 #   gha-vm.sh run <slot>        supervisor loop for one slot (systemd entrypoint)
 #   gha-vm.sh netcheck          assert the isolation rules are loaded (ExecStartPre)
 #   gha-vm.sh memguard [--once] shrink the fleet's memory ceiling to what the host can spare
+#   gha-vm.sh demand            queued jobs each on-demand slot would start for
 #   gha-vm.sh reap | clean [--force]     cleanup
 #
 # Isolation model: the boundary is the VM, not a namespace. Inside the guest the
@@ -65,6 +66,8 @@ FLEET_SLICE="$SYSTEMD_DIR/ghavm.slice"
 CGROUP_ROOT="${GHA_CGROUP_ROOT:-/sys/fs/cgroup}"
 # Where meminfo and pressure/memory are read; overridable for fixtures.
 PROC_ROOT="${GHA_PROC_ROOT:-/proc}"
+# The on-demand slots' API cache; empty = RUN_DIR/.demand-cache.
+DEMAND_CACHE="${GHA_DEMAND_CACHE:-}"
 
 # Guest prints this on the serial console once it is about to start the runner.
 # Absence of it inside BOOT_TIMEOUT means the VM never came up; kill it rather
@@ -207,6 +210,12 @@ apply_defaults() {
 	# idle runners are shed; 0 = ignore pressure.
 	HOST_PSI_MAX="${HOST_PSI_MAX:-10}"
 	MEMGUARD_INTERVAL="${MEMGUARD_INTERVAL:-5}"
+	# On-demand slots (ON_DEMAND_<n>=1): how often they look for a queued job
+	# that wants them, how long a booted VM may sit without one before it is
+	# shut down, and which repos of the org to watch (empty = all).
+	DEMAND_POLL_SEC="${DEMAND_POLL_SEC:-30}"
+	DEMAND_IDLE_SEC="${DEMAND_IDLE_SEC:-180}"
+	DEMAND_REPOS="${DEMAND_REPOS:-}"
 
 	RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,${RUNNER_ARCH},vm,ephemeral,docker}"
 	RUNNER_LABELS_APPEND_HOST="${RUNNER_LABELS_APPEND_HOST:-1}"
@@ -421,6 +430,9 @@ validate_sizing() {
 		die "HOST_PSI_MAX must be a percent from 0 to 100 (got '$HOST_PSI_MAX')"
 	fi
 	[[ "$MEMGUARD_INTERVAL" =~ ^[1-9][0-9]*$ ]] || die "MEMGUARD_INTERVAL must be a positive number of seconds (got '$MEMGUARD_INTERVAL')"
+	[[ "$DEMAND_POLL_SEC" =~ ^[1-9][0-9]*$ ]] || die "DEMAND_POLL_SEC must be a positive number of seconds (got '$DEMAND_POLL_SEC')"
+	[[ "$DEMAND_IDLE_SEC" =~ ^[1-9][0-9]*$ ]] || die "DEMAND_IDLE_SEC must be a positive number of seconds (got '$DEMAND_IDLE_SEC')"
+	[[ "$DEMAND_REPOS" =~ ^[A-Za-z0-9._/,\ -]*$ ]] || die "DEMAND_REPOS must be a comma-separated list of repo names (got '$DEMAND_REPOS')"
 	local zre='^[a-z0-9 ()/*+,.-]+$'
 	[[ "$HOST_ZRAM_SIZE" =~ $zre ]] || die "HOST_ZRAM_SIZE must be a zram-generator size expression like 'min(ram / 4, 8192)' (got '$HOST_ZRAM_SIZE')"
 	validate_slot_classes
@@ -460,10 +472,20 @@ slot_labels() {
 	[[ -n "${!k:-}" ]] && l+=",${!k}"
 	printf '%s' "$l"
 }
+slot_extra_labels() {
+	local k="RUNNER_LABELS_EXTRA_$1"
+	printf '%s' "${!k:-}"
+}
+# ON_DEMAND_<n>=1: the slot holds no VM and no runner until a queued job asks
+# for one of its RUNNER_LABELS_EXTRA_<n> labels.
+slot_on_demand() {
+	local k="ON_DEMAND_$1"
+	[[ "${!k:-0}" == 1 ]]
+}
 
 # Every per-slot key set anywhere in the config, one name per line.
 slot_class_keys() {
-	compgen -v | grep -E '^(VM_MEM|VM_CPUS|RUNNER_LABELS_EXTRA)_[0-9]+$' || :
+	compgen -v | grep -E '^(VM_MEM|VM_CPUS|RUNNER_LABELS_EXTRA|ON_DEMAND)_[0-9]+$' || :
 }
 
 # Slot numbers that carry any override, ascending.
@@ -483,6 +505,11 @@ validate_slot_classes() {
 			(($(slot_mem_mb "$n") > 0)) || die "$k must be above zero (got '${!k}')"
 			;;
 		VM_CPUS_*) [[ "${!k}" =~ ^[1-9][0-9]*$ ]] || die "$k must be a positive integer (got '${!k}')" ;;
+		ON_DEMAND_*)
+			[[ "${!k}" =~ ^[01]$ ]] || die "$k must be 0 or 1 (got '${!k}')"
+			[[ "${!k}" == 0 || -n "$(slot_extra_labels "$n")" ]] ||
+				die "$k needs RUNNER_LABELS_EXTRA_$n: the slot starts when a queued job asks for one of those labels"
+			;;
 		esac
 	done < <(slot_class_keys)
 }
@@ -810,6 +837,17 @@ fleet_admit() {
 		[[ "$reason" != "$last" ]] && log "slot $slot: waiting for memory: $reason"
 		last="$reason"
 		nap 10
+		# The job an on-demand slot queued for may be gone meanwhile (taken
+		# by another runner, cancelled); it must not hold the queue for it.
+		if [[ "$_DEMAND_SLOT" == "$slot" ]] && (($(date +%s) - _DEMAND_AT >= DEMAND_POLL_SEC)); then
+			local drc=0
+			demand_check "$slot" || drc=$?
+			if ((drc == 1)); then
+				log "slot $slot: no queued job asks for this slot any more; back to idle"
+				rm -f "$wf"
+				return 1
+			fi
+		fi
 		budget="$(fleet_live_budget_mb)"
 		if [[ -z "$budget" ]] && ((floor == 0)); then
 			rm -f "$wf"
@@ -942,6 +980,9 @@ _app_jwt() {
 
 _TOKEN=""
 _TOKEN_EXP=0
+# Set by an on-demand slot, whose token must also read the Actions queue.
+# Only then: asking for a permission the installation lacks fails the mint.
+DEMAND_TOKEN=0
 
 auth_token() {
 	if [[ "$AUTH_MODE" == pat ]]; then
@@ -966,13 +1007,16 @@ auth_token() {
 	# the installation does not hold is a 422 rather than a smaller token.
 	#   org  -> Organization permissions: "Self-hosted runners" (write)
 	#   repo -> Repository permissions:   "Administration" (write)
+	#   on-demand slots, either scope -> Repository permissions: "Actions" (read)
+	local extra=""
+	((DEMAND_TOKEN)) && extra=',"actions":"read","metadata":"read"'
 	if [[ "$SCOPE" == org ]]; then
 		inst_url="$GITHUB_API_URL/orgs/$GITHUB_ORG/installation"
-		perms='{"permissions":{"organization_self_hosted_runners":"write"}}'
+		perms='{"permissions":{"organization_self_hosted_runners":"write"'"$extra"'}}'
 		target="organization '$GITHUB_ORG'"
 	else
 		inst_url="$GITHUB_API_URL/repos/$GITHUB_REPO/installation"
-		perms='{"permissions":{"administration":"write"}}'
+		perms='{"permissions":{"administration":"write"'"$extra"'}}'
 		target="repository '$GITHUB_REPO'"
 	fi
 
@@ -1008,7 +1052,8 @@ if the name changed." ;;
 		die "could not mint an installation token. The app is installed but is
 probably missing its permission: $([[ "$SCOPE" == org ]] &&
 			echo 'Organization permissions > Self-hosted runners > Read and write' ||
-			echo 'Repository permissions > Administration > Read and write')
+			echo 'Repository permissions > Administration > Read and write')$( ((DEMAND_TOKEN)) &&
+				echo ', and for on-demand slots Repository permissions > Actions > Read-only')
 Set it under the app's Permissions page, then accept the request under the
 organization's Installed GitHub Apps entry."
 	_TOKEN=$(jq -r '.token' <<<"$resp")
@@ -1135,6 +1180,289 @@ mint_jit() {
 	body=$(jq -nc --arg n "$name" --argjson l "$labels" --argjson g "$gid" \
 		'{name:$n, runner_group_id:$g, labels:$l, work_folder:"_work"}')
 	api POST "$(runners_path)/generate-jitconfig" "$body" | jq -er '.encoded_jit_config'
+}
+
+# ---------------------------------------------------------------- demand ----
+#
+# An on-demand slot (ON_DEMAND_<n>=1) holds no VM and no runner until a queued
+# job asks for it. GitHub pushes queued jobs only to a webhook, so the slot
+# polls the queued and in-progress workflow runs of the watched repos every
+# DEMAND_POLL_SEC for a queued job whose labels its runner would all carry,
+# at least one of them from RUNNER_LABELS_EXTRA_<n>. Run listings go out with
+# If-None-Match, and an unchanged one comes back 304, which GitHub does not
+# count against the rate limit. A run's jobs are fetched again only when its
+# updated_at moved, or DEMAND_RECHECK_SEC after the last fetch.
+
+DEMAND_REPOS_TTL=600
+DEMAND_RECHECK_SEC=300
+DEMAND_IGNORE_SEC=3600
+_DEMAND_REPOS=""
+_DEMAND_REPOS_AT=0
+_DEMAND_SLOT=""
+# "<job id> <owner/repo>" found by the last check, and when it ran.
+_DEMAND_JOB=""
+_DEMAND_AT=0
+# The job the running VM was booted for.
+_DEMAND_BOOTED=""
+# "<job id>:<until epoch>" for jobs a VM was booted for and never got (a
+# runner group that excludes the repo, a job taken elsewhere), so they do not
+# boot the VM over and over.
+_DEMAND_IGNORE=""
+_DEMAND_SAID=""
+
+demand_cache_dir() { printf '%s' "${DEMAND_CACHE:-$RUN_DIR/.demand-cache}"; }
+
+# GET $1 through the demand cache. With a stamp $2 equal to the cached one the
+# cached body is printed without a request; otherwise the request carries the
+# cached etag, and a 304 prints the cached body. An entry is one file (etag,
+# stamp, body) replaced by one rename, so slots polling at once never pair one
+# response's body with another's etag.
+api_get_cached() {
+	local path="$1" stamp="${2:-}" f tok resp code hdr etag c_etag="" c_stamp="" c_body="" cond=()
+	f="$(demand_cache_dir)/$(printf '%s' "$path" | sha256sum | cut -c1-32)"
+	if [[ -r "$f" ]]; then
+		{
+			IFS= read -r c_etag
+			IFS= read -r c_stamp
+			c_body="$(cat)"
+		} <"$f"
+		if [[ -n "$stamp" && "$stamp" == "$c_stamp" ]]; then
+			printf '%s' "$c_body"
+			return 0
+		fi
+		[[ -n "$c_etag" ]] && cond=(-H "If-None-Match: $c_etag")
+	fi
+	tok="$(auth_token)" || return 1
+	[[ -n "$tok" ]] || return 1
+	hdr="$(mktemp)" || {
+		log "api: GET $path: could not create a temp file for the response headers"
+		return 1
+	}
+	if ! resp="$(curl_bearer "$tok" -D "$hdr" "${cond[@]}" --max-time "$API_MAXTIME" -w '\n%{http_code}' "$GITHUB_API_URL$path")"; then
+		rm -f "$hdr"
+		log "api: GET $path: request failed (no HTTP status)"
+		return 1
+	fi
+	code="${resp##*$'\n'}"
+	resp="${resp%$'\n'*}"
+	case "$code" in
+	200)
+		etag="$(awk 'tolower($1) == "etag:" { sub(/^[^:]*: */, ""); print; exit }' "$hdr" | tr -d '\r')"
+		rm -f "$hdr"
+		if [[ -n "$etag" || -n "$stamp" ]]; then
+			{
+				install -d -m 0700 "${f%/*}" &&
+					printf '%s\n%s\n%s' "$etag" "$stamp" "$resp" >"$f.$$" && mv -f "$f.$$" "$f"
+			} || log "api: WARN could not cache GET $path under ${f%/*}"
+		fi
+		printf '%s' "$resp"
+		;;
+	304)
+		rm -f "$hdr"
+		printf '%s' "$c_body"
+		;;
+	*)
+		rm -f "$hdr"
+		log "api: GET $path -> HTTP $code: $(jq -r '.message // empty' <<<"$resp" 2>/dev/null | head -c 200)"
+		return 1
+		;;
+	esac
+}
+
+# Refreshes _DEMAND_REPOS (owner/name per line) every DEMAND_REPOS_TTL: the
+# repo in repo scope, DEMAND_REPOS when set, else every unarchived repo the
+# credentials reach. Returns 1 when it cannot be listed and none is cached.
+demand_repos_refresh() {
+	local now list="" page resp n r names=() complete=0 cache
+	now=$(date +%s)
+	[[ -n "$_DEMAND_REPOS" ]] && ((now - _DEMAND_REPOS_AT < DEMAND_REPOS_TTL)) && return 0
+	# Entries for runs long finished are never read again.
+	cache="$(demand_cache_dir)"
+	if [[ -d "$cache" ]] && ! find "$cache" -type f -mmin +1440 -delete; then
+		log "demand: WARN could not prune old entries from $cache"
+	fi
+	if [[ "$SCOPE" == repo ]]; then
+		list="$GITHUB_REPO"
+	elif [[ -n "${DEMAND_REPOS//[ ,]/}" ]]; then
+		IFS=', ' read -ra names <<<"$DEMAND_REPOS"
+		for r in "${names[@]}"; do
+			[[ -n "$r" ]] || continue
+			[[ "$r" == */* ]] || r="$GITHUB_ORG/$r"
+			list+="$r"$'\n'
+		done
+	else
+		for ((page = 1; page <= 20; page++)); do
+			if [[ "$AUTH_MODE" == app ]]; then
+				resp="$(api GET "/installation/repositories?per_page=100&page=$page")" || break
+				resp="$(jq -c '.repositories' <<<"$resp")"
+			else
+				resp="$(api GET "/orgs/$GITHUB_ORG/repos?type=all&per_page=100&page=$page")" || break
+			fi
+			list+="$(jq -r '.[] | select(.archived | not) | .full_name' <<<"$resp")"$'\n'
+			n="$(jq 'length' <<<"$resp")"
+			if ((n < 100)); then
+				complete=1
+				break
+			fi
+		done
+		if ((page > 20)); then
+			log "demand: WARN watching the first 2000 repos only; set DEMAND_REPOS to the ones with on-demand jobs"
+			complete=1
+		fi
+		# A partial listing would hide the missing repos' jobs.
+		if ((!complete)); then
+			[[ -n "$_DEMAND_REPOS" ]] && return 0
+			return 1
+		fi
+	fi
+	_DEMAND_REPOS="$list"
+	_DEMAND_REPOS_AT=$now
+}
+
+# Queued jobs across the watched repos, one per line: "<job id> <owner/repo>
+# <labels>", labels lowercased and comma-joined. Returns 1 when any listing
+# failed, so a GitHub hiccup never reads as an empty queue.
+demand_queued_jobs() {
+	local repo st runs id updated jobs bucket n
+	bucket=$(($(date +%s) / DEMAND_RECHECK_SEC))
+	while read -r repo; do
+		[[ -n "$repo" ]] || continue
+		for st in queued in_progress; do
+			runs="$(api_get_cached "/repos/$repo/actions/runs?status=$st&per_page=100")" || return 1
+			n="$(jq '.workflow_runs | length' <<<"$runs")" || return 1
+			((n < 100)) || log "demand: WARN $repo has 100+ $st runs; only the newest 100 are checked"
+			while read -r id updated; do
+				[[ -n "$id" ]] || continue
+				jobs="$(api_get_cached "/repos/$repo/actions/runs/$id/jobs?filter=latest&per_page=100" "$updated/$bucket")" ||
+					return 1
+				n="$(jq '.jobs | length' <<<"$jobs")" || return 1
+				((n < 100)) || log "demand: WARN run $id in $repo has 100+ jobs; only the first 100 are checked"
+				jq -r --arg r "$repo" '.jobs[] | select(.status == "queued")
+					| "\(.id) \($r) \(.labels | map(ascii_downcase) | join(","))"' <<<"$jobs" || return 1
+			done < <(jq -r '.workflow_runs[] | "\(.id) \(.updated_at)"' <<<"$runs")
+		done
+	done <<<"$_DEMAND_REPOS"
+}
+
+# Whether a job labelled $1 is one this slot is for: every label is among the
+# runner's ($2), and one is among the slot's extra labels ($3). All lowercase,
+# comma-separated.
+demand_fits() {
+	local want="$1" have="$2" extra="$3" l hit=0 labels=()
+	IFS=, read -ra labels <<<"$want"
+	for l in "${labels[@]}"; do
+		[[ ",$have," == *",$l,"* ]] || return 1
+		[[ ",$extra," == *",$l,"* ]] && hit=1
+	done
+	((hit))
+}
+
+# Looks for a queued job on-demand slot $1 is for, with RUNNER_LABELS already
+# at the slot's class. 0: found, in _DEMAND_JOB; 1: none; 2: GitHub could not
+# be asked. Must run in the supervisor shell: it keeps the state above.
+demand_check() {
+	local slot="$1" jobs have extra id repo labels now tok
+	now=$(date +%s)
+	_DEMAND_AT=$now
+	_DEMAND_JOB=""
+	# Minted here so the listings, each in a subshell, reuse one token
+	# instead of minting their own.
+	if [[ "$AUTH_MODE" == app ]] && ((now >= _TOKEN_EXP - 300)); then
+		tok="$(auth_token)" || return 2
+		_TOKEN="$tok"
+		_TOKEN_EXP=$((now + 3600))
+	fi
+	demand_repos_refresh || return 2
+	jobs="$(demand_queued_jobs)" || return 2
+	have="$(runner_labels_json | jq -r 'map(ascii_downcase) | join(",")')"
+	extra="$(slot_extra_labels "$slot" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+	while read -r id repo labels; do
+		[[ -n "$id" ]] || continue
+		demand_ignored "$id" && continue
+		demand_fits "$labels" "$have" "$extra" || continue
+		_DEMAND_JOB="$id $repo"
+		return 0
+	done <<<"$jobs"
+	return 1
+}
+
+demand_ignored() {
+	local e now entries=()
+	now=$(date +%s)
+	read -ra entries <<<"$_DEMAND_IGNORE"
+	for e in "${entries[@]}"; do
+		[[ "${e%:*}" == "$1" ]] && ((${e#*:} > now)) && return 0
+	done
+	return 1
+}
+
+# Keeps job $1 from starting the slot for DEMAND_IGNORE_SEC.
+demand_ignore() {
+	local e now keep="" entries=()
+	[[ -n "$1" ]] || return 0
+	now=$(date +%s)
+	read -ra entries <<<"$_DEMAND_IGNORE"
+	for e in "${entries[@]}"; do
+		((${e#*:} > now)) && keep+="$e "
+	done
+	_DEMAND_IGNORE="$keep$1:$((now + DEMAND_IGNORE_SEC))"
+}
+
+# The run loop's gate for on-demand slot $1: 0 once a queued job wants it;
+# else logs what it is waiting on when that changes, naps DEMAND_POLL_SEC
+# and returns 1.
+demand_gate() {
+	local slot="$1" rc=0 state msg
+	demand_check "$slot" || rc=$?
+	case "$rc" in
+	0)
+		log "slot $slot: queued job ${_DEMAND_JOB% *} in ${_DEMAND_JOB#* } asks for this slot; starting"
+		_DEMAND_BOOTED="${_DEMAND_JOB%% *}"
+		_DEMAND_SAID=""
+		return 0
+		;;
+	1)
+		state=idle
+		msg="slot $slot: on demand; idle until a queued job asks for $(slot_extra_labels "$slot")"
+		;;
+	*)
+		state=error
+		msg="slot $slot: WARN could not read the Actions queue; retrying every ${DEMAND_POLL_SEC}s"
+		;;
+	esac
+	[[ "$state" == "$_DEMAND_SAID" ]] || log "$msg"
+	_DEMAND_SAID="$state"
+	nap "$DEMAND_POLL_SEC"
+	return 1
+}
+
+# Which queued job each on-demand slot would start for now.
+cmd_demand() {
+	local n rc found=0
+	# Run by hand as root, a shared cache would come out root-owned and
+	# unwritable for the supervisors.
+	if ((EUID == 0)) && [[ -z "$DEMAND_CACHE" ]]; then
+		DEMAND_CACHE="$(mktemp -d)"
+		trap 'rm -rf "$DEMAND_CACHE"' EXIT
+	fi
+	while read -r n; do
+		[[ -n "$n" ]] || continue
+		slot_on_demand "$n" || continue
+		found=1
+		rc=0
+		(
+			apply_slot_class "$n"
+			DEMAND_TOKEN=1
+			demand_check "$n" &&
+				printf 'slot %s: wanted by job %s in %s\n' "$n" "${_DEMAND_JOB% *}" "${_DEMAND_JOB#* }"
+		) || rc=$?
+		case "$rc" in
+		0) ;;
+		1) printf 'slot %s: idle; no queued job asks for %s\n' "$n" "$(slot_extra_labels "$n")" ;;
+		*) die "slot $n: could not read the Actions queue (see the api: lines above)" ;;
+		esac
+	done < <(slot_class_slots)
+	((found)) || echo "no on-demand slots (set ON_DEMAND_<n>=1 beside RUNNER_LABELS_EXTRA_<n>)"
 }
 
 # ------------------------------------------------------------------ deps ----
@@ -2630,6 +2958,12 @@ cmd_run() {
 	local slot="${1:-1}"
 	[[ "$slot" =~ ^[0-9]+$ ]] || die "slot must be a number"
 	apply_slot_class "$slot"
+	local on_demand=0
+	if slot_on_demand "$slot"; then
+		on_demand=1
+		DEMAND_TOKEN=1
+		_DEMAND_SLOT="$slot"
+	fi
 
 	# Checked before taking the lock so a misfit slot fails with the reason
 	# instead of queueing forever behind a budget it can never fit. Against
@@ -2771,6 +3105,10 @@ cmd_run() {
 			continue
 		fi
 
+		if ((on_demand)) && ! demand_gate "$slot"; then
+			continue
+		fi
+
 		# A runner is registered only once this VM fits in the fleet budget:
 		# an idle runner could take a job the host has no memory left for.
 		fleet_admit "$slot" "$need" || continue
@@ -2834,7 +3172,7 @@ cmd_run() {
 		"$QEMU_BIN" "${QEMU_ARGS[@]}" 9>&- &
 		vmpid=$!
 
-		local reason="" now elapsed short short_since=0
+		local reason="" now elapsed short short_since=0 idle_since=0 drc
 		ready=0
 		while kill -0 "$vmpid" 2>/dev/null; do
 			nap 5
@@ -2862,6 +3200,26 @@ cmd_run() {
 				fi
 				log "slot $slot: WARN could not deregister idle $name to shed it; retrying in ${HOST_SHED_SEC}s"
 				short_since=$now
+			fi
+			# An on-demand VM that got no job (another runner took it, it was
+			# cancelled, the runner group excludes its repo) stops unless
+			# another queued job asks for it.
+			if ((on_demand && ready)) && ! vm_has_job "$dir"; then
+				((idle_since)) || idle_since=$now
+				if ((now - idle_since >= DEMAND_IDLE_SEC)); then
+					demand_ignore "$_DEMAND_BOOTED"
+					drc=0
+					demand_check "$slot" || drc=$?
+					((drc == 0)) && _DEMAND_BOOTED="${_DEMAND_JOB%% *}"
+					if ((drc == 1)) && API_MAXTIME=10 API_RETRY=0 reap_one "$name"; then
+						log "slot $slot: $name got no job in ${DEMAND_IDLE_SEC}s and none is queued for it; stopping"
+						reason="no-demand"
+						break
+					fi
+					idle_since=$now
+				fi
+			else
+				idle_since=0
 			fi
 			if ((ready == 0 && elapsed > BOOT_TIMEOUT)); then
 				reason="boot-timeout"
@@ -3161,7 +3519,8 @@ cmd_capacity() {
 	while read -r n; do
 		[[ -n "$n" ]] || continue
 		k="RUNNER_LABELS_EXTRA_$n"
-		printf 'slot %-9s %s vCPU, %s RAM%s\n' "$n" "$(slot_cpus "$n")" "$(slot_mem "$n")" "${!k:+, extra labels ${!k}}"
+		printf 'slot %-9s %s vCPU, %s RAM%s%s\n' "$n" "$(slot_cpus "$n")" "$(slot_mem "$n")" "${!k:+, extra labels ${!k}}" \
+			"$(slot_on_demand "$n" && echo ', on demand')"
 	done < <(slot_class_slots)
 	if [[ "$FLEET_MEM" == off ]]; then
 		printf 'fleet memory   off  (no shared ceiling; each slot is capped at its own size)\n'
@@ -3388,7 +3747,8 @@ cmd_doctor() {
 	else echo OK; fi
 
 	printf 'firmware: '
-	if ovmf_pair >/dev/null 2>&1; then echo "OK ($(ovmf_pair | tr '\n' ' '))"; else
+	# Subshell: ovmf_pair dies when nothing matches, which would end the report.
+	if (ovmf_pair) >/dev/null 2>&1; then echo "OK ($(ovmf_pair | tr '\n' ' '))"; else
 		echo FAIL
 		ok=1
 	fi
@@ -3543,6 +3903,33 @@ cmd_doctor() {
 			echo "FAIL: the PAT needs the repo scope"
 		fi
 		ok=1
+	fi
+
+	local dslot
+	dslot="$(while read -r n; do [[ -n "$n" ]] && slot_on_demand "$n" && echo "$n"; done < <(slot_class_slots) | head -1)"
+	if [[ -n "$dslot" ]]; then
+		printf 'queued-job access (on-demand slot %s): ' "$dslot"
+		local derr="" drc=0
+		# Private cache: doctor runs as root and a shared one would come out
+		# unwritable for the supervisors.
+		# Exit 10 marks a readable queue (a job or none); a die inside exits 1.
+		derr="$( (
+			DEMAND_CACHE="$(mktemp -d)" || exit 2
+			trap 'rm -rf "$DEMAND_CACHE"' EXIT
+			apply_slot_class "$dslot"
+			DEMAND_TOKEN=1 _TOKEN="" _TOKEN_EXP=0
+			demand_check "$dslot" || (($? == 1)) || exit 2
+			exit 10
+		) 2>&1 >/dev/null)" || drc=$?
+		if ((drc == 10)); then echo OK; else
+			if [[ "$AUTH_MODE" == app ]]; then
+				echo "FAIL: grant the app Repository permissions > Actions > Read-only, then accept the re-issued installation request"
+			else
+				echo "FAIL: the PAT needs Actions read (classic: repo scope)"
+			fi
+			[[ -n "$derr" ]] && printf '  %s\n' "$derr"
+			ok=1
+		fi
 	fi
 
 	if [[ -n "$RUNNER_GROUP" && "$SCOPE" == org ]]; then
@@ -3749,6 +4136,8 @@ cmd_fleet() {
 			st="busy $vm"
 		elif [[ -n "$vm" ]]; then
 			st="idle $vm"
+		elif slot_on_demand "$n"; then
+			st="on demand: no VM until a queued job asks for $(slot_extra_labels "$n")"
 		else
 			st="starting"
 		fi
@@ -4237,7 +4626,7 @@ CONFIG_KEYS=(
 	MAX_LIFETIME BOOT_TIMEOUT MIN_FREE_GB
 	STOP_GRACE_SEC REAP_ON_STOP REAP_INTERVAL JIT_BACKOFF_MAX CLOCK_SYNC_WAIT
 	HOST_RESERVE_GB CPU_OVERCOMMIT DISK_PER_SLOT_GB FLEET_MEM MEM_OVERCOMMIT_PCT HOST_ZRAM HOST_ZRAM_SIZE
-	FLEET_SWAP_MAX HOST_MEM_FLOOR HOST_PSI_MAX MEMGUARD_INTERVAL
+	FLEET_SWAP_MAX HOST_MEM_FLOOR HOST_PSI_MAX MEMGUARD_INTERVAL DEMAND_POLL_SEC DEMAND_IDLE_SEC DEMAND_REPOS
 	RUNNER_VERSION RUNNER_SHA256 RUNNER_LABELS RUNNER_LABELS_APPEND_HOST RUNNER_GROUP_ID RUNNER_GROUP NAME_PREFIX
 	ALLOW_UNVERIFIED_RUNNER AUTO_RUNNER_VERSION UPGRADE_REBUILD SPARSIFY
 	APT_LOCK_WAIT APT_LOCK_TRIES REQUIRE_ISOLATION
@@ -4348,6 +4737,10 @@ main() {
 		load_config_optional
 		validate_sizing
 		cmd_memguard "$@"
+		;;
+	demand)
+		load_config
+		cmd_demand
 		;;
 	drain)
 		load_config
