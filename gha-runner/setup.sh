@@ -315,6 +315,8 @@ if [[ "$mode" == app ]]; then
 	info "  2. Homepage URL:     required but unused -- any URL will do"
 	info "  3. Webhook:          UNTICK \"Active\". This app receives nothing."
 	info "  4. Permissions:      $app_perm"
+	info "     For on-demand slots (ON_DEMAND_<n>=1, e.g. the services profile) also"
+	info "     Repository permissions > \"Actions\" > Read-only."
 	info "     Leave every other permission at \"No access\"."
 	info "  5. Where can this app be installed: \"Only on this account\""
 	info "  6. Create GitHub App."
