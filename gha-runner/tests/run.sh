@@ -299,12 +299,41 @@ $verify_out"
 	wait "$mgpid" || fail "memguard did not exit cleanly on TERM"
 	[[ "$(<"$sl/memory.high")" == $((20480 * 1048576)) ]] || fail "memguard left the fleet pinned on stop: $(<"$sl/memory.high")"
 	[[ "$(<"$sl/memory.max")" == $((22528 * 1048576)) ]] || fail "memguard did not restore MemoryMax on stop: $(<"$sl/memory.max")"
+	# Host under its floor while the fleet's swap is full: a MemoryHigh below
+	# the 16384M the guests hold could reclaim nothing and would freeze them.
+	mg_swap() { # memory.swap.current MiB, host SwapFree MiB
+		echo $((3072 * 1048576)) >"$sl/memory.swap.max"
+		echo $(($1 * 1048576)) >"$sl/memory.swap.current"
+		printf 'SwapFree:       %s kB\n' $(($2 * 1024)) >>"$proc/meminfo"
+		echo max >"$sl/memory.high"
+	}
+	echo $((18432 * 1048576)) >"$sl/memory.current"
+	host_mem 4000 0.00
+	mg_swap 3072 8000
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((16384 * 1048576)) ]] || fail "memguard throttled a fleet with no swap left below what it holds: $(<"$sl/memory.high")"
+	[[ "$(<"$sl/memory.max")" == $((17632 * 1048576)) ]] || fail "memguard max should still follow the host (15584M + 2048M): $(<"$sl/memory.max")"
+	host_mem 4000 0.00
+	mg_swap 2560 8000
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((15872 * 1048576)) ]] || fail "memguard high should be held minus the slice's 512M swap headroom: $(<"$sl/memory.high")"
+	host_mem 4000 0.00
+	mg_swap 0 300
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((16084 * 1048576)) ]] || fail "memguard swap headroom should be bounded by host SwapFree: $(<"$sl/memory.high")"
+	echo $((22528 * 1048576)) >"$sl/memory.current"
+	host_mem 1000 0.00
+	mg_swap 3072 8000
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((18728 * 1048576)) ]] || fail "memguard high must not exceed max, so the OOM killer still bounds the fleet: $(<"$sl/memory.high")"
+	[[ "$(<"$sl/memory.max")" == $((18728 * 1048576)) ]] || fail "memguard max should be 16680M + 2048M: $(<"$sl/memory.max")"
+	rm -f "$sl/memory.swap.max" "$sl/memory.swap.current"
 	fleet_env <<<$'FLEET_MEM=24G\nHOST_MEM_FLOOR=0'
 	if mg_once; then fail "memguard ran with HOST_MEM_FLOOR=0"; fi
 	fleet_env <<<'FLEET_MEM=off'
 	if mg_once; then fail "memguard ran with FLEET_MEM=off"; fi
 	unset GHA_PROC_ROOT
-	pass "memguard follows the host, keeps its step, caps, floors, and restores on stop"
+	pass "memguard follows the host, keeps its step, caps, floors, never freezes a fleet with no swap left, and restores on stop"
 
 	# On-demand slots: a fake curl serves GitHub's Actions API from fixture
 	# files keyed by request path, with etags, so the queue walk, the label
