@@ -308,8 +308,13 @@ fleet gives memory back instead of the host swapping itself to a standstill:
   what the VMs hold in anonymous memory plus the host's `MemAvailable` above
   the floor, never past the installed ceiling, with `MemoryMax` the usual
   margin above. When another service grows, running jobs are throttled and,
-  past `MemoryMax`, one VM is OOM-killed while the host keeps its floor. As
-  memory frees up the limits rise back; stopping the service restores them.
+  past `MemoryMax`, one VM is OOM-killed while the host keeps its floor.
+  `MemoryHigh` never drops below what the VMs hold minus the swap they can
+  still use (`MemorySwapMax` headroom, bounded by host `SwapFree`). Below that
+  line the kernel can reclaim nothing and throttles every guest indefinitely
+  without ever reaching `MemoryMax`, so jobs freeze and runners lose contact
+  with GitHub. As memory frees up the limits rise back; stopping the service
+  restores them.
 
 `HOST_MEM_FLOOR=0` turns all three off. They apply with `FLEET_MEM=off` too,
 except memguard, which needs a ceiling to move.

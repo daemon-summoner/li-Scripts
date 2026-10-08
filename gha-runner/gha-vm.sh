@@ -878,7 +878,11 @@ own_oom_kills() {
 # past the installed ceiling, and MemoryMax the usual margin above it. When
 # another service grows, the fleet is throttled and, past MemoryMax, loses a
 # VM to the OOM killer instead of the host thrashing. As memory frees up the
-# limits rise back to the ceiling. The files are written directly: a systemd
+# limits rise back to the ceiling. MemoryHigh never drops below what the fleet
+# holds minus the swap it can still use: over memory.high with nothing left to
+# reclaim, the kernel throttles every guest indefinitely without ever reaching
+# MemoryMax, so the VMs freeze mid-job (soft lockups, runners lost) instead of
+# one of them being OOM-killed. The files are written directly: a systemd
 # property per tick would pile up runtime drop-ins, and a daemon-reload that
 # restores the installed values is corrected on the next tick.
 
@@ -886,15 +890,39 @@ own_oom_kills() {
 # rather than be throttled or killed.
 MEMGUARD_MIN_MB=1024
 
-# MiB the fleet may hold now under a ceiling of $1 MiB.
-memguard_target_mb() {
-	local cap="$1" d="$CGROUP_ROOT/ghavm.slice" cur file t
+# MiB of swap the slice could still move guest memory into: its own
+# memory.swap.max headroom, bounded by the host's SwapFree.
+memguard_swap_room_mb() {
+	local d="$CGROUP_ROOT/ghavm.slice" room lim
+	room="$(meminfo_mb SwapFree)"
+	room="${room:-0}"
+	if [[ -r "$d/memory.swap.max" && -r "$d/memory.swap.current" ]]; then
+		lim="$(<"$d/memory.swap.max")"
+		if [[ "$lim" =~ ^[0-9]+$ ]]; then
+			lim=$(((lim - $(<"$d/memory.swap.current")) / 1048576))
+			((lim < 0)) && lim=0
+			((lim < room)) && room=$lim
+		fi
+	fi
+	printf '%s' "$room"
+}
+
+# "<high> <max>" MiB for the fleet under a ceiling of $1 MiB. max follows the
+# host; high follows it too but stays at or above what the fleet holds and
+# cannot swap out, and never above max.
+memguard_limits_mb() {
+	local cap="$1" d="$CGROUP_ROOT/ghavm.slice" cur file held t high max
 	cur="$(<"$d/memory.current")"
 	file="$(awk '$1 == "file" { print $2; exit }' "$d/memory.stat")"
-	t=$(((cur - ${file:-0}) / 1048576 + $(meminfo_mb MemAvailable) - $(host_floor_mb)))
+	held=$(((cur - ${file:-0}) / 1048576))
+	t=$((held + $(meminfo_mb MemAvailable) - $(host_floor_mb)))
 	((t > cap)) && t=$cap
 	((t < MEMGUARD_MIN_MB)) && t=$MEMGUARD_MIN_MB
-	printf '%s' "$t"
+	max=$((t + $(fleet_slack_mb "$cap")))
+	high=$((held - $(memguard_swap_room_mb)))
+	((high < t)) && high=$t
+	((high > max)) && high=$max
+	printf '%s %s' "$high" "$max"
 }
 
 memguard_write() { # high_mb max_mb
@@ -908,17 +936,17 @@ memguard_write() { # high_mb max_mb
 MEMGUARD_STEP_MB=256
 _MEMGUARD_LOGGED=""
 memguard_tick() {
-	local d="$CGROUP_ROOT/ghavm.slice" cap target live="" diff
+	local d="$CGROUP_ROOT/ghavm.slice" cap target max live="" diff
 	cap="$(fleet_cap_mb)"
 	[[ -n "$cap" && -r "$d/memory.high" ]] || return 0
-	target="$(memguard_target_mb "$cap")"
+	read -r target max <<<"$(memguard_limits_mb "$cap")"
 	live="$(<"$d/memory.high")"
 	if [[ "$live" =~ ^[0-9]+$ ]]; then
 		diff=$((live / 1048576 - target))
 		((diff < 0)) && diff=$((-diff))
 		((diff < MEMGUARD_STEP_MB)) && return 0
 	fi
-	memguard_write "$target" "$((target + $(fleet_slack_mb "$cap")))"
+	memguard_write "$target" "$max"
 	if ((target == cap)); then
 		[[ -n "$_MEMGUARD_LOGGED" && "$_MEMGUARD_LOGGED" != "$cap" ]] &&
 			log "memguard: host has room again; fleet ceiling back at ${cap}M"
