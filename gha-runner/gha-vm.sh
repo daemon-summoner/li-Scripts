@@ -25,6 +25,8 @@
 #   gha-vm.sh render            write units + ruleset to GHA_SYSTEMD_DIR/GHA_NFT_CONF
 #   gha-vm.sh run <slot>        supervisor loop for one slot (systemd entrypoint)
 #   gha-vm.sh netcheck          assert the isolation rules are loaded (ExecStartPre)
+#   gha-vm.sh pins              /etc/hosts lines the next VM gets from GUEST_PIN_HOSTS
+#   gha-vm.sh seed              cloud-init user-data the next VM gets (JIT config redacted)
 #   gha-vm.sh memguard [--once] shrink the fleet's memory ceiling to what the host can spare
 #   gha-vm.sh demand            queued jobs each on-demand slot would start for
 #   gha-vm.sh reap | clean [--force]     cleanup
@@ -248,6 +250,8 @@ apply_defaults() {
 	IMAGE_HOOK_DIR="${IMAGE_HOOK_DIR:-$(dirname "$CONFIG")/image.d}"
 	GUEST_PRE_JOB_HOOK="${GUEST_PRE_JOB_HOOK:-}"
 	GUEST_RUNTIME_DNS="${GUEST_RUNTIME_DNS:-}"
+	# Unset pins dl.google.com; set empty to pin nothing.
+	GUEST_PIN_HOSTS="${GUEST_PIN_HOSTS-dl.google.com}"
 	IMAGE_SELFTEST="${IMAGE_SELFTEST:-1}"
 	GOLDEN_KEEP_PREVIOUS="${GOLDEN_KEEP_PREVIOUS:-1}"
 	GOLDEN_MAX_AGE_DAYS="${GOLDEN_MAX_AGE_DAYS:-21}"
@@ -433,6 +437,7 @@ validate_sizing() {
 	[[ "$DEMAND_POLL_SEC" =~ ^[1-9][0-9]*$ ]] || die "DEMAND_POLL_SEC must be a positive number of seconds (got '$DEMAND_POLL_SEC')"
 	[[ "$DEMAND_IDLE_SEC" =~ ^[1-9][0-9]*$ ]] || die "DEMAND_IDLE_SEC must be a positive number of seconds (got '$DEMAND_IDLE_SEC')"
 	[[ "$DEMAND_REPOS" =~ ^[A-Za-z0-9._/,\ -]*$ ]] || die "DEMAND_REPOS must be a comma-separated list of repo names (got '$DEMAND_REPOS')"
+	[[ "$GUEST_PIN_HOSTS" =~ ^[A-Za-z0-9.,\ -]*$ ]] || die "GUEST_PIN_HOSTS must be a space or comma separated list of host names (got '$GUEST_PIN_HOSTS')"
 	local zre='^[a-z0-9 ()/*+,.-]+$'
 	[[ "$HOST_ZRAM_SIZE" =~ $zre ]] || die "HOST_ZRAM_SIZE must be a zram-generator size expression like 'min(ram / 4, 8192)' (got '$HOST_ZRAM_SIZE')"
 	validate_slot_classes
@@ -2960,6 +2965,68 @@ guest_network_config() {
 	printf 'version: 2\nethernets:\n  all:\n    match: { name: "e*" }\n    dhcp4: true\n    dhcp4-overrides: { use-dns: false }\n    nameservers: { addresses: [%s] }\n' "$addrs"
 }
 
+# GUEST_PIN_HOSTS reach the guests as /etc/hosts entries instead of through
+# DNS. For a CDN that maps this network onto a broken edge (an ISP-embedded
+# cache answering 502 or stalling mid-download): the lookup goes through
+# Google's DNS-over-HTTPS with a zero-length client subnet, so the answer is
+# not tied to where the host sits. TLS still checks the name, so a wrong
+# address fails closed. Resolved per VM, so the addresses never go stale.
+PIN_DOH_URL="https://dns.google/resolve"
+
+# "<addr> <host>" lines, IPv4 only (the guest network has no IPv6). A host
+# with no answer is logged and left to the guest's DNS; the job still runs.
+guest_pin_lines() {
+	local h addrs a
+	for h in ${GUEST_PIN_HOSTS//,/ }; do
+		addrs="$(curl -fsS "${CURL_OPTS[@]}" --max-time 10 -G "$PIN_DOH_URL" \
+			--data-urlencode "name=$h" -d type=A -d edns_client_subnet=0.0.0.0/0 |
+			jq -r '.Answer[]? | select(.type == 1) | .data' | addr_family 4)" || addrs=""
+		if [[ -z "$addrs" ]]; then
+			log "WARN: GUEST_PIN_HOSTS: no IPv4 address for $h from $PIN_DOH_URL; guests resolve it through DNS"
+			continue
+		fi
+		while read -r a; do
+			printf '%s %s\n' "$a" "$h"
+		done <<<"$addrs"
+	done
+}
+
+# cloud-init write_files entry appending the pins to the guest's /etc/hosts;
+# empty when nothing is pinned.
+guest_pin_seed_entry() {
+	[[ -n "$GUEST_PIN_HOSTS" ]] || return 0
+	local lines
+	lines="$(guest_pin_lines)"
+	[[ -n "$lines" ]] || return 0
+	printf '  - path: /etc/hosts\n    append: true\n    encoding: b64\n    content: %s\n' \
+		"$(printf '# gha-vm GUEST_PIN_HOSTS\n%s\n' "$lines" | base64 -w0)"
+}
+
+# cloud-init user-data for VM <name> carrying JIT runner config <jit>. The pin
+# entry comes through $(...), which strips its trailing newline, so the format
+# supplies the line break before runcmd; without it cloud-init rejects the whole
+# document and the runner never starts.
+guest_user_data() {
+	printf '#cloud-config\nhostname: %s\nusers: []\ndisable_root: true\nssh_pwauth: false\nwrite_files:\n  - path: /run/gha-jit\n    encoding: b64\n    permissions: "0600"\n    content: %s\n  - path: /run/gha-env\n    permissions: "0600"\n    content: "GHA_DOCKER_WAIT=%s\\n"\n%s\nruncmd:\n  - [ /usr/local/bin/gha-job.sh ]\n' \
+		"$1" "$(printf '%s' "$2" | base64 -w0)" "$((BOOT_TIMEOUT < 60 ? BOOT_TIMEOUT : 60))" \
+		"$(guest_pin_seed_entry)"
+}
+
+cmd_seed() {
+	guest_user_data "gha-seed-preview" "REDACTED-JIT-CONFIG"
+}
+
+cmd_pins() {
+	if [[ -z "$GUEST_PIN_HOSTS" ]]; then
+		echo "GUEST_PIN_HOSTS is empty; guests resolve every host through DNS"
+		return 0
+	fi
+	local lines
+	lines="$(guest_pin_lines)"
+	[[ -n "$lines" ]] || die "no GUEST_PIN_HOSTS entry resolved; guests would fall back to DNS for all of them"
+	printf '%s\n' "$lines"
+}
+
 drain_flag() { printf '%s/.slot-%s.drain' "$RUN_DIR" "$1"; }
 
 # Runner.Listener prints this when GitHub hands it a job. Until then the VM is
@@ -3170,8 +3237,7 @@ cmd_run() {
 		fi
 		mint_fails=0
 
-		printf '#cloud-config\nhostname: %s\nusers: []\ndisable_root: true\nssh_pwauth: false\nwrite_files:\n  - path: /run/gha-jit\n    encoding: b64\n    permissions: "0600"\n    content: %s\n  - path: /run/gha-env\n    permissions: "0600"\n    content: "GHA_DOCKER_WAIT=%s\\n"\nruncmd:\n  - [ /usr/local/bin/gha-job.sh ]\n' \
-			"$name" "$(printf '%s' "$jit" | base64 -w0)" "$((BOOT_TIMEOUT < 60 ? BOOT_TIMEOUT : 60))" >"$dir/user-data"
+		guest_user_data "$name" "$jit" >"$dir/user-data"
 		printf 'instance-id: %s\nlocal-hostname: %s\n' "$name" "$name" >"$dir/meta-data"
 		local netcfg=()
 		if [[ -n "$GUEST_RUNTIME_DNS" ]]; then
@@ -4586,9 +4652,9 @@ cmd_install() {
 		slot_list all
 	} | sort -nu)
 
-	local was_active=0
+	local was_active=()
 	for i in $(seq 1 "$count"); do
-		systemctl is-active --quiet "gha-vm@${i}.service" 2>/dev/null && was_active=$((was_active + 1))
+		systemctl is-active --quiet "gha-vm@${i}.service" 2>/dev/null && was_active+=("$i")
 		systemctl enable --now "gha-vm@${i}.service"
 	done
 	systemctl enable --now gha-vm-upgrade.timer >/dev/null 2>&1 ||
@@ -4606,10 +4672,33 @@ cmd_install() {
 	fi
 
 	log "installed $count slots; logs: journalctl -fu 'gha-vm@*'"
-	if ((was_active)); then
-		log "$was_active slot(s) were already running and keep the old unit/script until restarted: $SELF restart all"
-	fi
+	install_restart_idle "${was_active[@]}"
 	cmd_capacity
+}
+
+# Restarts the already-running slots whose VM has no job, so the next job
+# already runs on the new script, unit and config instead of an idle VM booted
+# from the old ones. The drain flag keeps the supervisor from booting a fresh
+# VM between the stop and the restart. A busy slot is left alone: its
+# supervisor re-executes the new script once the job ends, and only a unit
+# change still waits for `restart`.
+install_restart_idle() {
+	local s busy=()
+	install -d -m 0750 "$RUN_DIR"
+	for s in "$@"; do
+		: >"$(drain_flag "$s")"
+		if slot_has_job "$s" || ! stop_idle_vm "$s"; then
+			rm -f "$(drain_flag "$s")"
+			busy+=("$s")
+			continue
+		fi
+		rm -f "$(drain_flag "$s")"
+		systemctl restart "gha-vm@${s}.service" ||
+			die "could not restart gha-vm@${s}.service (see: journalctl -u gha-vm@${s})"
+		log "slot $s: idle; restarted on the new install"
+	done
+	((${#busy[@]} == 0)) ||
+		log "slot(s) ${busy[*]} are running a job; they pick up the new script and config when it ends (unit changes: $SELF restart all)"
 }
 
 cmd_uninstall() {
@@ -4659,7 +4748,7 @@ CONFIG_KEYS=(
 	ALLOW_UNVERIFIED_RUNNER AUTO_RUNNER_VERSION UPGRADE_REBUILD SPARSIFY
 	APT_LOCK_WAIT APT_LOCK_TRIES REQUIRE_ISOLATION
 	NET_ALLOW_CIDRS NET_BLOCK_EXTRA NET_BLOCK_HOST_ADDRS NET_DNS_ADDRS NET_HOST_ADDRS NET_ENDPOINT_ADDRS
-	GUEST_PACKAGES GUEST_EXTRA_PACKAGES IMAGE_HOOK_DIR GUEST_PRE_JOB_HOOK GUEST_RUNTIME_DNS
+	GUEST_PACKAGES GUEST_EXTRA_PACKAGES IMAGE_HOOK_DIR GUEST_PRE_JOB_HOOK GUEST_RUNTIME_DNS GUEST_PIN_HOSTS
 	IMAGE_SELFTEST GOLDEN_KEEP_PREVIOUS GOLDEN_MAX_AGE_DAYS
 	HOST_UNATTENDED HOST_AUTO_REBOOT HOST_AUTO_REBOOT_TIME
 	MAX_SLOTS AUTOTUNE AUTOTUNE_HEADROOM_GB HOST_PROFILE PROFILE_FILE LOCAL_FILE
@@ -4760,6 +4849,16 @@ main() {
 	netcheck)
 		load_config
 		cmd_netcheck
+		;;
+	pins)
+		load_config_optional
+		validate_sizing
+		cmd_pins
+		;;
+	seed)
+		load_config_optional
+		validate_sizing
+		cmd_seed
 		;;
 	memguard)
 		load_config_optional
