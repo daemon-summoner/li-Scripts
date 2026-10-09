@@ -25,7 +25,7 @@ inside() {
 	local update="$1" out=/out rc=0
 	export DEBIAN_FRONTEND=noninteractive
 	apt-get update -qq >/dev/null
-	apt-get install -y -qq --no-install-recommends systemd nftables jq >/dev/null
+	apt-get install -y -qq --no-install-recommends systemd nftables jq curl ca-certificates python3-yaml >/dev/null
 	groupadd -f kvm
 	id -u gha >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -u 999 gha
 	install -d -m 0750 -g gha /etc/gha-vm
@@ -626,6 +626,53 @@ $nft_out"
 		fail "render accepted a non-numeric RUNNER_GROUP_ID"
 	fi
 	pass "bare VM_MEM normalized; non-numeric RUNNER_GROUP_ID refused"
+
+	# --- pinned guest hosts ---------------------------------------------------
+	# Real lookups against dns.google: the point is what Google answers.
+	local pin=/tmp/pin.env pins
+	[[ "$("$gha" config GUEST_PIN_HOSTS)" == dl.google.com ]] || fail "GUEST_PIN_HOSTS does not default to dl.google.com"
+	{
+		cat /tests/config.test.env
+		printf 'GUEST_PIN_HOSTS=\n'
+	} >"$pin"
+	[[ "$(GHA_CONFIG=$pin "$gha" config GUEST_PIN_HOSTS)" == "" ]] || fail "an empty GUEST_PIN_HOSTS did not turn pinning off"
+	[[ "$(GHA_CONFIG=$pin "$gha" pins)" == *"GUEST_PIN_HOSTS is empty"* ]] || fail "pins with pinning off should say so"
+	{
+		cat /tests/config.test.env
+		printf 'GUEST_PIN_HOSTS="dl.google.com, maven.google.com"\n'
+	} >"$pin"
+	pins="$(GHA_CONFIG=$pin "$gha" pins)" || fail "pins failed for dl.google.com, maven.google.com"
+	grep -Eq '^[0-9]+(\.[0-9]+){3} dl\.google\.com$' <<<"$pins" || fail "no IPv4 pin for dl.google.com: $pins"
+	grep -Eq '^[0-9]+(\.[0-9]+){3} maven\.google\.com$' <<<"$pins" || fail "no IPv4 pin for maven.google.com: $pins"
+	! grep -Evq '^[0-9]+(\.[0-9]+){3} (dl|maven)\.google\.com$' <<<"$pins" || fail "pins printed a malformed line: $pins"
+	# The seed must stay one valid cloud-config with or without pins: a broken
+	# document makes cloud-init skip runcmd, so the runner never starts.
+	GHA_CONFIG=$pin "$gha" seed | python3 -c '
+import base64, sys, yaml
+d = yaml.safe_load(sys.stdin)
+assert d["runcmd"] == [["/usr/local/bin/gha-job.sh"]], d.get("runcmd")
+files = {f["path"]: f for f in d["write_files"]}
+assert base64.b64decode(files["/run/gha-jit"]["content"]) == b"REDACTED-JIT-CONFIG"
+hosts = files["/etc/hosts"]
+assert hosts["append"] is True, hosts
+text = base64.b64decode(hosts["content"]).decode()
+assert " dl.google.com" in text and " maven.google.com" in text, text
+' || fail "seed with pins is not the cloud-config the guest expects: $(GHA_CONFIG=$pin "$gha" seed)"
+	GHA_CONFIG=/tests/config.test.env GUEST_PIN_HOSTS='' "$gha" seed | python3 -c '
+import sys, yaml
+d = yaml.safe_load(sys.stdin)
+assert d["runcmd"] == [["/usr/local/bin/gha-job.sh"]], d.get("runcmd")
+assert [f["path"] for f in d["write_files"]] == ["/run/gha-jit", "/run/gha-env"], d["write_files"]
+' || fail "seed without pins is not the cloud-config the guest expects"
+	printf 'GUEST_PIN_HOSTS=no-such-host.invalid\n' >>"$pin"
+	if GHA_CONFIG=$pin "$gha" pins >/dev/null 2>&1; then
+		fail "pins succeeded although no host resolved"
+	fi
+	printf 'GUEST_PIN_HOSTS="dl.google.com;reboot"\n' >>"$pin"
+	if GHA_CONFIG=$pin GHA_SYSTEMD_DIR=/tmp/pinbad GHA_NFT_CONF=/tmp/pinbad/n.conf "$gha" render 2>/dev/null; then
+		fail "render accepted a GUEST_PIN_HOSTS with shell metacharacters"
+	fi
+	pass "GUEST_PIN_HOSTS resolves through DoH, lands in a valid seed, fails loudly when nothing resolves, refuses junk"
 
 	# --- atomic config editor ------------------------------------------------
 	local c=/tmp/edit.env

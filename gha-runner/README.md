@@ -184,16 +184,18 @@ sudo gha-vm undrain 3
 sudo gha-vm restart all        # drain every slot, restart its unit, undrain
 ```
 
-`restart` is what to run after editing `gha-vm.sh` and re-running `install`.
-It drains every slot up front, restarts idle ones at once and busy ones as
+`install` restarts the slots that are idle right then, so their next job
+already runs the new script and config; busy slots are left to finish.
+`restart` is what to run when the unit itself changed and the busy slots must
+follow too. It drains every slot up front, restarts idle ones at once and busy ones as
 their job finishes (up to `STOP_GRACE_SEC`); `gha-vm fleet` shows which is
 which. An idle slot's VM is stopped by `restart` itself after its runner is
 deregistered, so a supervisor still running an older script never holds the
 restart for its grace period. `setup.sh` offers this restart when it finds
 slots already running.
 The supervisor also notices when its own script file changes on disk and
-re-execs itself between jobs, so a plain `install` is picked up without a
-restart; `restart` only matters when the unit file itself changed.
+re-execs itself between jobs, so a busy slot picks up a plain `install` once
+its job ends.
 
 ### Host updates
 
@@ -607,6 +609,18 @@ call is pinned to HTTPS with TLS 1.2 or later.
   calls and the image build. `GUEST_RUNTIME_DNS` pins the guest's resolvers.
 
 Re-run `sudo gha-vm image` after changing any of these; they are baked in.
+
+`GUEST_PIN_HOSTS` is the exception: it is resolved for every VM and needs no
+rebuild. Each listed host is looked up through Google's DNS-over-HTTPS with no
+client location and written into the guest's `/etc/hosts`, which steers jobs
+around a CDN edge that is broken for this network. The case it exists for:
+on Google Fiber, `dl.google.com` (Android SDK packages and Google's Maven repo)
+can map to an ISP-embedded cache that answers 502 after ~20 s or stalls a
+download after a couple of MiB, while Google's regular edges serve the same
+file in a second. It defaults to `dl.google.com`; set it empty to pin
+nothing. `gha-vm pins` prints what the next VM would get, and `gha-vm seed` the whole cloud-init user-data with the JIT config redacted. TLS still
+verifies the name, so a bad answer fails closed. Containers started by a job
+keep Docker's own `/etc/hosts` and are not covered.
 
 `doctor` fails loudly when the repo or org is public: a fork PR on a public repo
 runs attacker-authored code on your hardware. Use a private repo, or restrict
