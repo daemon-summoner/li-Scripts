@@ -204,9 +204,20 @@ $verify_out"
 	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: fleet holds 22016M of 24576M; this slot needs 8192M free$' <<<"$fo" ||
 		fail "slot 3 should wait on memory, ahead of the dead slot 4 waiter: $fo"
 	grep -Eq '^5 +8192M +0M +waiting 1[0-9]s: queued behind slot 3$' <<<"$fo" || fail "slot 5 should queue behind slot 3: $fo"
-	echo "$((now - 600)) 16384" >"$run/.slot-2.claim"
+	# An idle VM admitted long ago still counts at full size: the job it picks
+	# up grows it there, and the host cannot take guest RAM back.
+	echo "$((now - 36000)) 16384" >"$run/.slot-2.claim"
 	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
-	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s$' <<<"$fo" || fail "an expired claim still blocks slot 3: $fo"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: fleet holds 22016M of 24576M; this slot needs 8192M free$' <<<"$fo" ||
+		fail "a VM running for hours should still claim its full size: $fo"
+	# MEM_OVERCOMMIT_PCT adds slots, not room: the claim stays whole.
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nMEM_OVERCOMMIT_PCT=200\nRUN_DIR='"$run"
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -q '^claimed    13312M' <<<"$fo" || fail "MEM_OVERCOMMIT_PCT=200 must not shrink slot 2's claim: $fo"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: fleet holds 22016M of 24576M' <<<"$fo" ||
+		fail "MEM_OVERCOMMIT_PCT=200 let slot 3 into room a running VM still claims: $fo"
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nRUN_DIR='"$run"
+	rm "$run/.slot-2.claim"
 	grep -q '^host       40000M available, 4800M kept for other services, pressure 0% (limit 10%)$' <<<"$fo" ||
 		fail "fleet does not report the host's memory: $fo"
 
@@ -300,7 +311,9 @@ $verify_out"
 	[[ "$(<"$sl/memory.high")" == $((20480 * 1048576)) ]] || fail "memguard left the fleet pinned on stop: $(<"$sl/memory.high")"
 	[[ "$(<"$sl/memory.max")" == $((22528 * 1048576)) ]] || fail "memguard did not restore MemoryMax on stop: $(<"$sl/memory.max")"
 	# Host under its floor while the fleet's swap is full: a MemoryHigh below
-	# the 16384M the guests hold could reclaim nothing and would freeze them.
+	# the 16384M the guests hold could reclaim nothing and would freeze them,
+	# and one right at it would throttle every page they add before the next
+	# tick, so it keeps 512M of headroom.
 	mg_swap() { # memory.swap.current MiB, host SwapFree MiB
 		echo $((3072 * 1048576)) >"$sl/memory.swap.max"
 		echo $(($1 * 1048576)) >"$sl/memory.swap.current"
@@ -311,16 +324,21 @@ $verify_out"
 	host_mem 4000 0.00
 	mg_swap 3072 8000
 	mg_once || fail "memguard --once exited non-zero"
-	[[ "$(<"$sl/memory.high")" == $((16384 * 1048576)) ]] || fail "memguard throttled a fleet with no swap left below what it holds: $(<"$sl/memory.high")"
+	[[ "$(<"$sl/memory.high")" == $((16896 * 1048576)) ]] || fail "memguard high should be the 16384M held with no swap left + 512M headroom: $(<"$sl/memory.high")"
 	[[ "$(<"$sl/memory.max")" == $((17632 * 1048576)) ]] || fail "memguard max should still follow the host (15584M + 2048M): $(<"$sl/memory.max")"
+	# The live run that froze: MemoryHigh 123M under what the fleet held, which
+	# the 256M step alone would have left in place.
+	echo $(((16384 - 123) * 1048576)) >"$sl/memory.high"
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((16896 * 1048576)) ]] || fail "memguard left MemoryHigh under memory the fleet cannot give back: $(<"$sl/memory.high")"
 	host_mem 4000 0.00
 	mg_swap 2560 8000
 	mg_once || fail "memguard --once exited non-zero"
-	[[ "$(<"$sl/memory.high")" == $((15872 * 1048576)) ]] || fail "memguard high should be held minus the slice's 512M swap headroom: $(<"$sl/memory.high")"
+	[[ "$(<"$sl/memory.high")" == $((16384 * 1048576)) ]] || fail "memguard high should be held minus the slice's 512M swap headroom, plus 512M: $(<"$sl/memory.high")"
 	host_mem 4000 0.00
 	mg_swap 0 300
 	mg_once || fail "memguard --once exited non-zero"
-	[[ "$(<"$sl/memory.high")" == $((16084 * 1048576)) ]] || fail "memguard swap headroom should be bounded by host SwapFree: $(<"$sl/memory.high")"
+	[[ "$(<"$sl/memory.high")" == $((16596 * 1048576)) ]] || fail "memguard swap headroom should be bounded by host SwapFree (16384M - 300M + 512M): $(<"$sl/memory.high")"
 	echo $((22528 * 1048576)) >"$sl/memory.current"
 	host_mem 1000 0.00
 	mg_swap 3072 8000

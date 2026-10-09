@@ -315,8 +315,8 @@ if [[ "$mode" == app ]]; then
 	info "  2. Homepage URL:     required but unused -- any URL will do"
 	info "  3. Webhook:          UNTICK \"Active\". This app receives nothing."
 	info "  4. Permissions:      $app_perm"
-	info "     For on-demand slots (ON_DEMAND_<n>=1, e.g. the services profile) also"
-	info "     Repository permissions > \"Actions\" > Read-only."
+	info "     If slot 1 will be a bigger 'large' VM (booted only when a job asks"
+	info "     for it), also Repository permissions > \"Actions\" > Read-only."
 	info "     Leave every other permission at \"No access\"."
 	info "  5. Where can this app be installed: \"Only on this account\""
 	info "  6. Create GitHub App."
@@ -462,9 +462,12 @@ done
 if [[ "$mem1" == none ]]; then
 	"$GHA" config-unset VM_MEM_1 "$sizing_file"
 	"$GHA" config-unset RUNNER_LABELS_EXTRA_1 "$sizing_file"
+	"$GHA" config-unset ON_DEMAND_1 "$sizing_file"
 else
 	cfg_set_in "$sizing_file" VM_MEM_1 "$mem1"
 	cfg_set_in "$sizing_file" RUNNER_LABELS_EXTRA_1 "$(cfg_get RUNNER_LABELS_EXTRA_1 | grep . || echo large)"
+	# Idle, it would hold its full size and keep the smaller runners out.
+	cfg_set_in "$sizing_file" ON_DEMAND_1 "$(cfg_get ON_DEMAND_1 | grep . || echo 1)"
 fi
 hint "All VMs share one memory budget. At 100% the slot count is what fits with"
 hint "every VM at full size; above it, extra slots wait until the VMs' real use"
