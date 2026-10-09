@@ -46,8 +46,8 @@ takes about two minutes.
 
    With an on-demand slot (`ON_DEMAND_<n>=1`, see [On-demand slots](#on-demand-slots)),
    also Repository permissions → **Actions** → Read-only, so the slot can see
-   queued jobs. The `services` profile has one. `sudo gha-vm doctor` checks it
-   (`queued-job access`).
+   queued jobs. `setup.sh` makes a bigger slot 1 one, and the `services`
+   profile has one. `sudo gha-vm doctor` checks it (`queued-job access`).
 
    Leave everything else at *No access*. Getting this wrong is the most common
    failure: the app installs fine and then every token mint returns 422.
@@ -246,16 +246,20 @@ RUNNER_LABELS_EXTRA_1=large   # runs-on: [self-hosted, large]
 MEM_OVERCOMMIT_PCT=200        # capacity may plan 16G + 4 x 8G into 24G
 ```
 
-A slot registers a runner only when what the VMs really hold (resident memory
-and swap, not page cache) plus that slot's full size fits in the budget.
+A slot registers a runner only when every running VM at its full size (or what
+it really holds, resident memory and swap but not page cache, if that is more)
+plus that slot's full size fits in the budget.
 Otherwise it waits, first come first served, and says why in the journal and in
 `gha-vm fleet`. A waiting slot too big to start even if every running VM exited
 (larger than the live ceiling, or than the host can spare) does not hold back
 smaller slots that fit. Nothing is registered while it waits, so GitHub cannot hand it a
-job the host has no room for. A VM that has just started counts at its full size
-for 5 minutes, which stops several slots that free up together from all taking
-the same gap. Idle guests hand unused pages back through `virtio-balloon`
-free-page-reporting, so light jobs leave room for more slots.
+job the host has no room for. An idle runner holds little, but the job it can
+pick up at any moment grows it to full size, and the host cannot take guest
+RAM back: counting only what idle VMs hold would admit more than the fleet
+holds, and when their jobs land together the kernel OOM-kills VMs mid-job.
+`MEM_OVERCOMMIT_PCT` adds slots, never room: the extra ones wait here until
+running VMs exit. A big always-on slot holds its full size even while idle,
+which is why `setup.sh` makes the large slot on-demand (below).
 
 Admission cannot stop a VM that is already running from growing into its full
 size. That growth is bounded by the kernel. All slot units run in
@@ -732,7 +736,7 @@ fleet accounting are checked against a fixture cgroup tree via
 | `/var/lib/gha-vm/run/<name>/` | one live VM: overlay, seed, UEFI vars, console log |
 | `/var/lib/gha-vm/run/.slot-<n>.drain` | drain flag; the slot idles while it exists |
 | `/var/lib/gha-vm/run/.slot-<n>.wait` | the slot is waiting for fleet memory, since this epoch |
-| `/var/lib/gha-vm/run/.slot-<n>.claim` | memory a just-started VM may still grow into, counted for 5 min |
+| `/var/lib/gha-vm/run/.slot-<n>.claim` | memory a running VM may still grow into, counted until it exits |
 | `/etc/systemd/system/ghavm.slice` | the fleet's shared memory ceiling (`FLEET_MEM`) |
 | `/etc/systemd/system/gha-vm-memguard.service` | lowers that ceiling live while the host is short (`HOST_MEM_FLOOR`) |
 | `/etc/systemd/system/gha-vm@<n>.service.d/50-gha-vm-size.conf` | per-slot `MemoryMax` from `VM_MEM_<n>` |

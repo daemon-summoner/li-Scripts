@@ -608,19 +608,18 @@ fleet_used_mb() {
 	printf '%s' "$((r + s))"
 }
 
-# A VM just admitted has touched almost none of its RAM yet, so for this long
-# after admission the rest of its size still counts against the fleet. That
-# keeps slots freed at the same moment from all fitting into one gap.
-FLEET_CLAIM_SEC=300
-
+# A running VM keeps its whole size claimed until it exits. An idle runner
+# touches little of its RAM, but the job it may pick up at any moment grows it
+# to full size, and the host cannot take guest RAM back: counting only what
+# idle VMs use admits more than the fleet holds once their jobs land together,
+# and the kernel then OOM-kills VMs mid-job. MEM_OVERCOMMIT_PCT stretches how
+# many slots exist, never these claims: the extra slots wait their turn.
 claim_flag() { printf '%s/.slot-%s.claim' "$RUN_DIR" "$1"; }
 
-# MiB that slots admitted in the last FLEET_CLAIM_SEC may still grow into:
-# each one's size minus what it already uses. Claims of dead supervisors and
-# of slot $1 itself are skipped.
+# MiB that running VMs may still grow into: each one's size minus what it
+# already uses. Claims of dead supervisors and of slot $1 itself are skipped.
 fleet_claims_mb() {
-	local self="${1:-}" f k at need used total=0 now
-	now=$(date +%s)
+	local self="${1:-}" f k at need used total=0
 	for f in "$RUN_DIR"/.slot-*.claim; do
 		[[ -r "$f" ]] || continue
 		k="${f##*/.slot-}"
@@ -628,7 +627,6 @@ fleet_claims_mb() {
 		[[ "$k" =~ ^[0-9]+$ && "$k" != "$self" ]] || continue
 		read -r at need <"$f" || continue
 		[[ "$at" =~ ^[0-9]+$ && "$need" =~ ^[0-9]+$ ]] || continue
-		((now - at < FLEET_CLAIM_SEC)) || continue
 		slot_is_live "$k" || continue
 		used="$(fleet_used_mb "$k")"
 		((need > used)) && total=$((total + need - used))
@@ -884,7 +882,8 @@ own_oom_kills() {
 # another service grows, the fleet is throttled and, past MemoryMax, loses a
 # VM to the OOM killer instead of the host thrashing. As memory frees up the
 # limits rise back to the ceiling. MemoryHigh never drops below what the fleet
-# holds minus the swap it can still use: over memory.high with nothing left to
+# holds minus the swap it can still use, plus MEMGUARD_HEADROOM_MB for the
+# guests to grow into between ticks: over memory.high with nothing left to
 # reclaim, the kernel throttles every guest indefinitely without ever reaching
 # MemoryMax, so the VMs freeze mid-job (soft lockups, runners lost) instead of
 # one of them being OOM-killed. The files are written directly: a systemd
@@ -912,9 +911,15 @@ memguard_swap_room_mb() {
 	printf '%s' "$room"
 }
 
+# Room MemoryHigh keeps above what the fleet cannot give back, so guests that
+# grow between ticks are not throttled before the next tick raises it. Twice
+# MEMGUARD_STEP_MB: a live value the step leaves alone is then still at least a
+# step above that memory, never under it.
+MEMGUARD_HEADROOM_MB=512
+
 # "<high> <max>" MiB for the fleet under a ceiling of $1 MiB. max follows the
-# host; high follows it too but stays at or above what the fleet holds and
-# cannot swap out, and never above max.
+# host; high follows it too but stays MEMGUARD_HEADROOM_MB above what the fleet
+# holds and cannot swap out, and never above max.
 memguard_limits_mb() {
 	local cap="$1" d="$CGROUP_ROOT/ghavm.slice" cur file held t high max
 	cur="$(<"$d/memory.current")"
@@ -924,7 +929,7 @@ memguard_limits_mb() {
 	((t > cap)) && t=$cap
 	((t < MEMGUARD_MIN_MB)) && t=$MEMGUARD_MIN_MB
 	max=$((t + $(fleet_slack_mb "$cap")))
-	high=$((held - $(memguard_swap_room_mb)))
+	high=$((held - $(memguard_swap_room_mb) + MEMGUARD_HEADROOM_MB))
 	((high < t)) && high=$t
 	((high > max)) && high=$max
 	printf '%s %s' "$high" "$max"
@@ -4183,7 +4188,7 @@ cmd_fleet() {
 	read -r r sw <<<"$(fleet_mem_usage)"
 	claims="$(fleet_claims_mb)"
 	printf 'in use     %sM  (%sM resident + %sM swapped; page cache not counted)\n' "$((r + sw))" "$r" "$sw"
-	((claims > 0)) && printf 'claimed    %sM  (VMs started in the last %ss, not yet at full size)\n' "$claims" "$FLEET_CLAIM_SEC"
+	((claims > 0)) && printf 'claimed    %sM  (running VMs not yet at full size)\n' "$claims"
 	[[ -n "$budget" ]] && printf 'free       %sM\n' "$((budget - r - sw - claims))"
 	floor="$(host_floor_mb)"
 	if ((floor > 0)); then
