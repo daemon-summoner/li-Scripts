@@ -27,6 +27,7 @@
 #   gha-vm.sh netcheck          assert the isolation rules are loaded (ExecStartPre)
 #   gha-vm.sh pins              /etc/hosts lines the next VM gets from GUEST_PIN_HOSTS
 #   gha-vm.sh seed              cloud-init user-data the next VM gets (JIT config redacted)
+#   gha-vm.sh labels <slot>     labels slot <slot>'s runner registers with
 #   gha-vm.sh memguard [--once] shrink the fleet's memory ceiling to what the host can spare
 #   gha-vm.sh demand            queued jobs each on-demand slot would start for
 #   gha-vm.sh reap | clean [--force]     cleanup
@@ -221,6 +222,9 @@ apply_defaults() {
 
 	RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,${RUNNER_ARCH},vm,ephemeral,docker}"
 	RUNNER_LABELS_APPEND_HOST="${RUNNER_LABELS_APPEND_HOST:-1}"
+	# Unset gives every slot without RUNNER_LABELS_EXTRA_<n> the label
+	# `standard`; set empty to give them nothing extra.
+	RUNNER_LABELS_STANDARD="${RUNNER_LABELS_STANDARD-standard}"
 	RUNNER_GROUP_ID="${RUNNER_GROUP_ID:-1}"
 	RUNNER_GROUP="${RUNNER_GROUP:-}"
 	NAME_PREFIX="${NAME_PREFIX:-gha-$(hostname -s)}"
@@ -460,7 +464,10 @@ mem_to_mb() { # accepts 8G / 8192M / 8 (bare = GiB)
 
 # A slot may run a bigger (or smaller) VM than the rest: VM_MEM_<n>,
 # VM_CPUS_<n> and RUNNER_LABELS_EXTRA_<n> override VM_MEM, VM_CPUS and add
-# labels for slot n, so workflows can target the big one by label.
+# labels for slot n, so workflows can target the big one by label. Every other
+# slot carries RUNNER_LABELS_STANDARD instead: GitHub hands a job to any runner
+# holding all the labels it asks for, so a job that should stay off the big
+# slot asks for one only the others carry.
 slot_mem() {
 	local k="VM_MEM_$1" v
 	v="${!k:-$VM_MEM}"
@@ -474,7 +481,11 @@ slot_cpus() {
 }
 slot_labels() {
 	local k="RUNNER_LABELS_EXTRA_$1" l="$RUNNER_LABELS"
-	[[ -n "${!k:-}" ]] && l+=",${!k}"
+	if [[ -n "${!k:-}" ]]; then
+		l+=",${!k}"
+	elif [[ -n "$RUNNER_LABELS_STANDARD" ]]; then
+		l+=",$RUNNER_LABELS_STANDARD"
+	fi
 	printf '%s' "$l"
 }
 slot_extra_labels() {
@@ -806,6 +817,26 @@ fleet_block_reason() {
 		fi
 	fi
 	host_block_reason "$need" "$claims"
+}
+
+# Why idle slot $1 should give its memory back to a bigger slot waiting for
+# it; empty when none waits. An idle runner holds its full size for up to
+# MAX_LIFETIME, so without this a large job queues for hours behind runners
+# with no job. A waiter no bigger than slot $1 never counts: the runner gains
+# it nothing by stepping aside. The shed slot queues again behind the waiter.
+fleet_shed_reason() {
+	local slot="$1" budget head need since reason
+	budget="$(fleet_live_budget_mb)"
+	head="$(fleet_waiter_ahead "$slot" "$(($(date +%s) + 1))" "$budget")"
+	[[ -n "$head" ]] || return 0
+	need="$(slot_mem_mb "$head")"
+	((need > $(slot_mem_mb "$slot"))) || return 0
+	# The waiter may be admitted between the scan and this read.
+	since="$(cat "$(wait_flag "$head")" 2>/dev/null)" || return 0
+	[[ "$since" =~ ^[0-9]+$ ]] || return 0
+	reason="$(fleet_block_reason "$head" "$need" "$since" "$budget")"
+	[[ -n "$reason" ]] && printf 'slot %s (%sM) is waiting for memory: %s' "$head" "$need" "$reason"
+	return 0
 }
 
 # Blocks until slot $1 may register a runner for a VM of $2 MiB, then claims
@@ -3021,6 +3052,12 @@ cmd_seed() {
 	guest_user_data "gha-seed-preview" "REDACTED-JIT-CONFIG"
 }
 
+cmd_labels() {
+	[[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || die "usage: $SELF labels <slot>"
+	apply_slot_class "$1"
+	runner_labels_json | jq -r 'join(",")'
+}
+
 cmd_pins() {
 	if [[ -z "$GUEST_PIN_HOSTS" ]]; then
 		echo "GUEST_PIN_HOSTS is empty; guests resolve every host through DNS"
@@ -3271,7 +3308,7 @@ cmd_run() {
 		"$QEMU_BIN" "${QEMU_ARGS[@]}" 9>&- &
 		vmpid=$!
 
-		local reason="" now elapsed short short_since=0 idle_since=0 drc
+		local reason="" now elapsed short shed_kind="" short_since=0 idle_since=0 drc
 		ready=0
 		while kill -0 "$vmpid" 2>/dev/null; do
 			nap 5
@@ -3281,12 +3318,20 @@ cmd_run() {
 				ready=1
 				log "slot $slot: $name up after ${elapsed}s"
 			fi
-			# An idle runner on a host that has run short gives its memory
-			# back and queues for admission again. It is deregistered first:
-			# GitHub refuses to delete a runner that has taken a job, so a
-			# successful delete means no job can land on the VM being killed.
+			# An idle runner on a host that has run short, or holding memory a
+			# bigger waiting slot needs, gives its memory back and queues for
+			# admission again. It is deregistered first: GitHub refuses to
+			# delete a runner that has taken a job, so a successful delete
+			# means no job can land on the VM being killed.
 			short=""
-			((ready)) && ! vm_has_job "$dir" && short="$(host_shed_reason)"
+			if ((ready)) && ! vm_has_job "$dir"; then
+				short="$(host_shed_reason)"
+				shed_kind=host-memory
+				if [[ -z "$short" ]]; then
+					short="$(fleet_shed_reason "$slot")"
+					shed_kind=make-way
+				fi
+			fi
 			if [[ -z "$short" ]]; then
 				short_since=0
 			elif ((short_since == 0)); then
@@ -3294,7 +3339,7 @@ cmd_run() {
 			elif ((now - short_since >= HOST_SHED_SEC)); then
 				if API_MAXTIME=10 API_RETRY=0 reap_one "$name"; then
 					log "slot $slot: shedding idle $name: $short"
-					reason="host-memory"
+					reason="$shed_kind"
 					break
 				fi
 				log "slot $slot: WARN could not deregister idle $name to shed it; retrying in ${HOST_SHED_SEC}s"
@@ -4234,7 +4279,8 @@ cmd_fleet() {
 		elif [[ -n "$vm" ]] && vm_has_job "$RUN_DIR/$vm"; then
 			st="busy $vm"
 		elif [[ -n "$vm" ]]; then
-			st="idle $vm"
+			reason="$(fleet_shed_reason "$n")"
+			st="idle $vm${reason:+; giving way: $reason}"
 		elif slot_on_demand "$n"; then
 			st="on demand: no VM until a queued job asks for $(slot_extra_labels "$n")"
 		else
@@ -4749,7 +4795,7 @@ CONFIG_KEYS=(
 	STOP_GRACE_SEC REAP_ON_STOP REAP_INTERVAL JIT_BACKOFF_MAX CLOCK_SYNC_WAIT
 	HOST_RESERVE_GB CPU_OVERCOMMIT DISK_PER_SLOT_GB FLEET_MEM MEM_OVERCOMMIT_PCT HOST_ZRAM HOST_ZRAM_SIZE
 	FLEET_SWAP_MAX HOST_MEM_FLOOR HOST_PSI_MAX MEMGUARD_INTERVAL DEMAND_POLL_SEC DEMAND_IDLE_SEC DEMAND_REPOS
-	RUNNER_VERSION RUNNER_SHA256 RUNNER_LABELS RUNNER_LABELS_APPEND_HOST RUNNER_GROUP_ID RUNNER_GROUP NAME_PREFIX
+	RUNNER_VERSION RUNNER_SHA256 RUNNER_LABELS RUNNER_LABELS_APPEND_HOST RUNNER_LABELS_STANDARD RUNNER_GROUP_ID RUNNER_GROUP NAME_PREFIX
 	ALLOW_UNVERIFIED_RUNNER AUTO_RUNNER_VERSION UPGRADE_REBUILD SPARSIFY
 	APT_LOCK_WAIT APT_LOCK_TRIES REQUIRE_ISOLATION
 	NET_ALLOW_CIDRS NET_BLOCK_EXTRA NET_BLOCK_HOST_ADDRS NET_DNS_ADDRS NET_HOST_ADDRS NET_ENDPOINT_ADDRS
@@ -4864,6 +4910,11 @@ main() {
 		load_config_optional
 		validate_sizing
 		cmd_seed
+		;;
+	labels)
+		load_config_optional
+		validate_sizing
+		cmd_labels "$@"
 		;;
 	memguard)
 		load_config_optional

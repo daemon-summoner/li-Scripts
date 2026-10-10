@@ -243,8 +243,24 @@ FLEET_MEM=24G
 VM_MEM=8G
 VM_MEM_1=16G                  # slot 1 is the big one
 RUNNER_LABELS_EXTRA_1=large   # runs-on: [self-hosted, large]
+                              # the other slots: [self-hosted, standard]
 MEM_OVERCOMMIT_PCT=200        # capacity may plan 16G + 4 x 8G into 24G
 ```
+
+GitHub hands a job to any runner that holds every label the job asks for, so
+a job asking `runs-on: [self-hosted, linux]` can land on the big slot and hold
+it for a small job. Every slot without `RUNNER_LABELS_EXTRA_<n>` therefore also
+registers with `standard` (`RUNNER_LABELS_STANDARD`; empty turns it off): small
+jobs ask for `[self-hosted, standard]`, big ones for `[self-hosted, large]`.
+`gha-vm labels <slot>` prints what a slot registers with.
+
+An idle runner holds its full size until it takes a job or reaches
+`MAX_LIFETIME`, so a big slot waiting for memory would wait hours behind small
+runners with no job. Instead, once a slot bigger than an idle runner heads the
+queue and is still held out after 30 s, the idle runner deregisters, stops,
+and queues again behind it (`make-way` in the journal; `gha-vm fleet` shows it
+as `giving way`). A runner never gives way to a slot no bigger than itself, nor
+to one the host could not fit even with every VM gone.
 
 A slot registers a runner only when every running VM at its full size (or what
 it really holds, resident memory and swap but not page cache, if that is more)
@@ -682,7 +698,8 @@ runs-on: [self-hosted, linux, x64, kvm]
 - A slot does not register a runner until its VM fits in the fleet memory
   budget and the host has it to spare (see "Shared fleet memory" and "Sharing
   the host with other services"); an idle runner on a host that runs short is
-  deregistered and logged as `host-memory`. A VM the kernel OOM-kills, because it
+  deregistered and logged as `host-memory`, and one holding memory a bigger
+  waiting slot needs is deregistered and logged as `make-way`. A VM the kernel OOM-kills, because it
   passed its slot's `MemoryMax` or the fleet passed the slice's, is logged as
   `oom-killed` and deregistered. The unit keeps running (`OOMPolicy=continue`)
   and the slot starts a fresh VM.
