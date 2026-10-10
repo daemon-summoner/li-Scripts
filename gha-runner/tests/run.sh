@@ -204,6 +204,8 @@ $verify_out"
 	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: fleet holds 22016M of 24576M; this slot needs 8192M free$' <<<"$fo" ||
 		fail "slot 3 should wait on memory, ahead of the dead slot 4 waiter: $fo"
 	grep -Eq '^5 +8192M +0M +waiting 1[0-9]s: queued behind slot 3$' <<<"$fo" || fail "slot 5 should queue behind slot 3: $fo"
+	grep -Eq '^2 +16384M +3072M +idle gha-test-2-ef01$' <<<"$fo" ||
+		fail "idle slot 2 gave way to an 8G slot no bigger than itself: $fo"
 	# An idle VM admitted long ago still counts at full size: the job it picks
 	# up grows it there, and the host cannot take guest RAM back.
 	echo "$((now - 36000)) 16384" >"$run/.slot-2.claim"
@@ -243,11 +245,15 @@ $verify_out"
 	host_mem 14000 0.00
 	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
 	grep -Eq '^3 +24576M +0M +waiting 2[0-9]s: fleet holds' <<<"$fo" || fail "slot 3 should still wait for its own room: $fo"
+	grep -Eq '^2 +16384M +3072M +idle gha-test-2-ef01$' <<<"$fo" ||
+		fail "idle slot 2 gave way to a slot 3 the host cannot fit even with it gone: $fo"
 	grep -Eq '^5 +8192M +0M +waiting 1[0-9]s$' <<<"$fo" || fail "slot 5 should not queue behind a slot 3 the host cannot fit: $fo"
 	host_mem 40000 0.00
 	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
 	grep -Eq '^5 +8192M +0M +waiting 1[0-9]s: queued behind slot 3$' <<<"$fo" ||
 		fail "slot 5 should queue behind a slot 3 that fits once the fleet drains: $fo"
+	grep -Eq '^2 +16384M +3072M +idle gha-test-2-ef01; giving way: slot 3 \(24576M\) is waiting for memory: fleet holds' <<<"$fo" ||
+		fail "idle slot 2 should give its memory to the bigger slot 3 waiting for it: $fo"
 	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nRUN_DIR='"$run"
 	host_mem 13000 0.00
 	host_mem 40000 25.31
@@ -631,6 +637,23 @@ $nft_out"
 	labels="$(GHA_CONFIG=$nv "$gha" profile 2>/dev/null | sed -n 's/^labels  *//p')"
 	[[ -n "$labels" && ",$labels," != *,kvm,* ]] || fail "arm64 host advertises kvm: $labels"
 	pass "kvm label follows NESTED_VIRT on x64 only"
+
+	# A job asking for `standard` must never land on the large slot, so only the
+	# slots without RUNNER_LABELS_EXTRA_<n> carry it.
+	local sl=/tmp/sl.env
+	{
+		cat /tests/config.test.env
+		printf 'RUNNER_LABELS_APPEND_HOST=0\n'
+	} >"$sl"
+	labels="$(GHA_CONFIG=$sl "$gha" labels 1)"
+	[[ "$labels" == "docker,ephemeral,large,linux,self-hosted,vm,x64" ]] || fail "large slot labels wrong: $labels"
+	labels="$(GHA_CONFIG=$sl "$gha" labels 2)"
+	[[ "$labels" == "docker,ephemeral,linux,self-hosted,standard,vm,x64" ]] || fail "small slot labels wrong: $labels"
+	printf 'RUNNER_LABELS_STANDARD=\n' >>"$sl"
+	labels="$(GHA_CONFIG=$sl "$gha" labels 2)"
+	[[ "$labels" == "docker,ephemeral,linux,self-hosted,vm,x64" ]] || fail "empty RUNNER_LABELS_STANDARD still added a label: $labels"
+	if GHA_CONFIG=$sl "$gha" labels 0 2>/dev/null; then fail "labels accepted slot 0"; fi
+	pass "only the slots without extra labels carry the standard label"
 
 	printf 'SCOPE=org\nGITHUB_ORG=x\nAUTH_MODE=app\nRUNNER_VERSION=2.336.0\nGHA_UID=999\nAUTOTUNE=0\nVM_MEM=lots\n' >/tmp/bad.env
 	if GHA_CONFIG=/tmp/bad.env GHA_SYSTEMD_DIR=/tmp/bad GHA_NFT_CONF=/tmp/bad/n.conf "$gha" render 2>/dev/null; then
