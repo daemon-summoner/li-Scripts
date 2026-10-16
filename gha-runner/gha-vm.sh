@@ -369,7 +369,19 @@ host_is_virtual() {
 
 # Used by deps and capacity, which must work before the operator has written a
 # config. Everything else goes through load_config and gets the hard checks.
+# Dies when the config exists but this user cannot read it (root-only
+# /etc/gha-vm): running on would leave every answer on the defaults, with
+# wrong slot sizes and RUN_DIR, or blame a config that is not missing.
+require_config_access() {
+	local dir="${CONFIG%/*}"
+	if [[ ! -r "$CONFIG" ]] && [[ -e "$CONFIG" || (-d "$dir" && ! -x "$dir") ]]; then
+		die "$CONFIG is not readable by $(id -un); run this command with sudo"
+	fi
+	return 0
+}
+
 load_config_optional() {
+	require_config_access
 	if [[ -r "$CONFIG" ]]; then
 		# shellcheck disable=SC1090
 		source "$CONFIG"
@@ -379,6 +391,7 @@ load_config_optional() {
 }
 
 load_config() {
+	require_config_access
 	[[ -r "$CONFIG" ]] || die "config not readable: $CONFIG (try: $SELF deps)"
 
 	local mode
@@ -772,14 +785,29 @@ fleet_could_fit() {
 	((need <= $(meminfo_mb MemAvailable) + $(fleet_resident_mb) - floor))
 }
 
-# The earliest-waiting live slot other than $1 that queued before $2 (epoch
-# seconds; ties go to the lower slot), under a live budget of $3 MiB. Empty
-# when $1 is at the head. A wait file whose supervisor is gone is ignored: it
-# died without cleaning up. So is a waiter too big for the fleet even emptied
-# (memguard holding the budget low, the host short): others running would not
-# be what keeps it out, and holding them back would leave no runner at all.
+# A waiter's place in the admission queue: on-demand slots first, since one
+# only waits while a queued job asks for it and an always-on slot only wants
+# a spare runner; then by when it queued (epoch seconds); then the lower slot.
+fleet_queue_key() { printf '%d %d %d' "$(slot_on_demand "$1" && echo 0 || echo 1)" "$2" "$1"; }
+
+# Whether queue key $1 goes before queue key $2.
+fleet_key_before() {
+	local a1 a2 a3 b1 b2 b3
+	read -r a1 a2 a3 <<<"$1"
+	read -r b1 b2 b3 <<<"$2"
+	((a1 < b1 || (a1 == b1 && (a2 < b2 || (a2 == b2 && a3 < b3)))))
+}
+
+# The live slot other than $1 that goes before $1, queued at $2, in the
+# admission queue and is first among those, under a live budget of $3 MiB.
+# Empty when $1 is at the head. A wait file whose supervisor is gone is
+# ignored: it died without cleaning up. So is a waiter too big for the fleet
+# even emptied (memguard holding the budget low, the host short): others
+# running would not be what keeps it out, and holding them back would leave
+# no runner at all.
 fleet_waiter_ahead() {
-	local slot="$1" since="$2" budget="$3" f k ts best="" best_ts=""
+	local slot="$1" since="$2" budget="$3" mine f k ts key best="" best_key=""
+	mine="$(fleet_queue_key "$slot" "$since")"
 	for f in "$RUN_DIR"/.slot-*.wait; do
 		[[ -r "$f" ]] || continue
 		k="${f##*/.slot-}"
@@ -787,12 +815,13 @@ fleet_waiter_ahead() {
 		[[ "$k" =~ ^[0-9]+$ && "$k" != "$slot" ]] || continue
 		ts="$(<"$f")"
 		[[ "$ts" =~ ^[0-9]+$ ]] || continue
-		((ts < since || (ts == since && k < slot))) || continue
+		key="$(fleet_queue_key "$k" "$ts")"
+		fleet_key_before "$key" "$mine" || continue
 		slot_is_live "$k" || continue
 		fleet_could_fit "$(slot_mem_mb "$k")" "$budget" || continue
-		if [[ -z "$best" ]] || ((ts < best_ts || (ts == best_ts && k < best))); then
+		if [[ -z "$best" ]] || fleet_key_before "$key" "$best_key"; then
 			best="$k"
-			best_ts="$ts"
+			best_key="$key"
 		fi
 	done
 	printf '%s' "$best"
