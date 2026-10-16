@@ -73,7 +73,7 @@ NESTED_VIRT=0
 
 | Profile | Machine | Slots |
 |---|---|---|
-| `services.env` | 24 vCPU / 46G, QEMU guest, runs llama-server + minio + containers | 5: one 16G + four 8G in a 24G shared budget |
+| `services.env` | 24 vCPU / 46G, QEMU guest, runs llama-server + minio + containers | 5: one 12G + four 8G in a 24G shared budget |
 
 A dedicated 128G box needs no file here: autotune already sizes it to roughly
 `(128 − reserve) / 8` = 15 slots. Add one only to pin `MAX_SLOTS` or to change

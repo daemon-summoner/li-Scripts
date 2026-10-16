@@ -254,6 +254,19 @@ $verify_out"
 		fail "slot 5 should queue behind a slot 3 that fits once the fleet drains: $fo"
 	grep -Eq '^2 +16384M +3072M +idle gha-test-2-ef01; giving way: slot 3 \(24576M\) is waiting for memory: fleet holds' <<<"$fo" ||
 		fail "idle slot 2 should give its memory to the bigger slot 3 waiting for it: $fo"
+	# An on-demand waiter has a queued job; an always-on one only wants a spare
+	# runner. The on-demand slot goes first even though it queued later, and
+	# an idle runner smaller than it gives way.
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_5=12G\nON_DEMAND_5=1\nRUNNER_LABELS_EXTRA_5=large\nRUN_DIR='"$run"
+	echo "$now 8192" >"$run/.slot-2.claim"
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -Eq '^5 +12288M +0M +waiting 1[0-9]s: fleet holds 13824M of 24576M; this slot needs 12288M free$' <<<"$fo" ||
+		fail "on-demand slot 5 should head the queue and wait only for memory: $fo"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: queued behind slot 5$' <<<"$fo" ||
+		fail "always-on slot 3 should queue behind the on-demand slot 5: $fo"
+	grep -Eq '^2 +8192M +3072M +idle gha-test-2-ef01; giving way: slot 5 \(12288M\) is waiting for memory' <<<"$fo" ||
+		fail "idle slot 2 should give way to the on-demand slot 5 behind an always-on waiter: $fo"
+	rm "$run/.slot-2.claim"
 	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nRUN_DIR='"$run"
 	host_mem 13000 0.00
 	host_mem 40000 25.31
@@ -748,6 +761,30 @@ assert [f["path"] for f in d["write_files"]] == ["/run/gha-jit", "/run/gha-env"]
 		fail "config-set accepted an invalid key"
 	fi
 	pass "config-set/config-unset are atomic, quoted and idempotent"
+
+	# An unprivileged user must be told to use sudo, not shown the defaults
+	# (every slot "stopped" at VM_MEM) as if they were the host's state.
+	local ro=/tmp/ro
+	install -d -m 0700 "$ro"
+	cp /tests/config.test.env "$ro/config.env"
+	local ro_out
+	if ro_out="$(GHA_CONFIG=$ro/config.env setpriv --reuid=65534 --regid=65534 --clear-groups "$gha" fleet 2>&1)"; then
+		fail "fleet ran on defaults with an unreadable config: $ro_out"
+	fi
+	grep -q 'not readable by .*; run this command with sudo' <<<"$ro_out" || fail "wrong refusal for an unreadable config: $ro_out"
+	chmod 0711 "$ro"
+	chmod 0600 "$ro/config.env"
+	if ro_out="$(GHA_CONFIG=$ro/config.env setpriv --reuid=65534 --regid=65534 --clear-groups "$gha" config 2>&1)"; then
+		fail "config ran on defaults with an unreadable config file: $ro_out"
+	fi
+	grep -q 'run this command with sudo' <<<"$ro_out" || fail "wrong refusal for an unreadable config file: $ro_out"
+	if ro_out="$(GHA_CONFIG=$ro/config.env setpriv --reuid=65534 --regid=65534 --clear-groups "$gha" status 2>&1)"; then
+		fail "status ran with an unreadable config: $ro_out"
+	fi
+	grep -q 'run this command with sudo' <<<"$ro_out" || fail "status blamed a missing config instead of asking for sudo: $ro_out"
+	GHA_CONFIG=$ro/none.env setpriv --reuid=65534 --regid=65534 --clear-groups "$gha" config RUNNER_LABELS >/dev/null ||
+		fail "a missing config must still fall back to the defaults"
+	pass "an unreadable config asks for sudo instead of showing defaults"
 
 	# --- usage ---------------------------------------------------------------
 	local u

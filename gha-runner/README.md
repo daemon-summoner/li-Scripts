@@ -265,8 +265,9 @@ to one the host could not fit even with every VM gone.
 A slot registers a runner only when every running VM at its full size (or what
 it really holds, resident memory and swap but not page cache, if that is more)
 plus that slot's full size fits in the budget.
-Otherwise it waits, first come first served, and says why in the journal and in
-`gha-vm fleet`. A waiting slot too big to start even if every running VM exited
+Otherwise it waits, first come first served except that an on-demand slot
+(which waits only while a queued job asks for it) goes before always-on ones,
+and says why in the journal and in `gha-vm fleet`. A waiting slot too big to start even if every running VM exited
 (larger than the live ceiling, or than the host can spare) does not hold back
 smaller slots that fit. Nothing is registered while it waits, so GitHub cannot hand it a
 job the host has no room for. An idle runner holds little, but the job it can
@@ -404,7 +405,7 @@ gha-vm fleet      # an idle one shows "on demand: no VM until a queued job asks 
 | already resident | ~nothing | ~18 GB (llama-server, minio, clamd, containers) |
 | autotuned reserve | ~8 GB | ~23 GB |
 | per slot | 4 vCPU / 8 GB / 30 GB | 4 vCPU / 8 GB / 30 GB |
-| **slots** | **~15**, memory-bound | **5**, 4 × 8G plus a 16G `large` slot booted on demand, at 200% of `FLEET_MEM=24G` |
+| **slots** | **~15**, memory-bound | **5**, 4 × 8G plus a 12G `large` slot booted on demand, at 200% of `FLEET_MEM=24G` |
 | profile file | none needed | `profiles/services.env` |
 
 The dedicated box needs no profile — autotune already lands on the right

@@ -468,6 +468,20 @@ else
 	cfg_set_in "$sizing_file" RUNNER_LABELS_EXTRA_1 "$(cfg_get RUNNER_LABELS_EXTRA_1 | grep . || echo large)"
 	# Idle, it would hold its full size and keep the smaller runners out.
 	cfg_set_in "$sizing_file" ON_DEMAND_1 "$(cfg_get ON_DEMAND_1 | grep . || echo 1)"
+	# An app created before the large slot existed lacks the permission, and
+	# GitHub only applies an added one once the installation accepts it.
+	if [[ "$mode" == app && "$(cfg_get ON_DEMAND_1)" == 1 ]]; then
+		if [[ "$scope" == org ]]; then
+			installs_url="$server_url/organizations/$org/settings/installations"
+		else
+			installs_url="$server_url/settings/installations"
+		fi
+		hint "Slot 1 boots only when a queued job asks for it, so the app must read the"
+		hint "Actions queue. On an existing app: $app_list -> your app -> Permissions &"
+		hint "events -> Repository permissions > \"Actions\" > Read-only -> Save changes;"
+		hint "then $installs_url -> the app -> Configure -> accept the request."
+		hint "The preflight checks report it if it is still missing."
+	fi
 fi
 hint "All VMs share one memory budget. At 100% the slot count is what fits with"
 hint "every VM at full size; above it, extra slots wait until the VMs' real use"
