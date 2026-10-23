@@ -25,7 +25,7 @@ inside() {
 	local update="$1" out=/out rc=0
 	export DEBIAN_FRONTEND=noninteractive
 	apt-get update -qq >/dev/null
-	apt-get install -y -qq --no-install-recommends systemd nftables jq >/dev/null
+	apt-get install -y -qq --no-install-recommends systemd nftables jq curl ca-certificates python3-yaml >/dev/null
 	groupadd -f kvm
 	id -u gha >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -u 999 gha
 	install -d -m 0750 -g gha /etc/gha-vm
@@ -204,9 +204,22 @@ $verify_out"
 	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: fleet holds 22016M of 24576M; this slot needs 8192M free$' <<<"$fo" ||
 		fail "slot 3 should wait on memory, ahead of the dead slot 4 waiter: $fo"
 	grep -Eq '^5 +8192M +0M +waiting 1[0-9]s: queued behind slot 3$' <<<"$fo" || fail "slot 5 should queue behind slot 3: $fo"
-	echo "$((now - 600)) 16384" >"$run/.slot-2.claim"
+	grep -Eq '^2 +16384M +3072M +idle gha-test-2-ef01$' <<<"$fo" ||
+		fail "idle slot 2 gave way to an 8G slot no bigger than itself: $fo"
+	# An idle VM admitted long ago still counts at full size: the job it picks
+	# up grows it there, and the host cannot take guest RAM back.
+	echo "$((now - 36000)) 16384" >"$run/.slot-2.claim"
 	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
-	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s$' <<<"$fo" || fail "an expired claim still blocks slot 3: $fo"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: fleet holds 22016M of 24576M; this slot needs 8192M free$' <<<"$fo" ||
+		fail "a VM running for hours should still claim its full size: $fo"
+	# MEM_OVERCOMMIT_PCT adds slots, not room: the claim stays whole.
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nMEM_OVERCOMMIT_PCT=200\nRUN_DIR='"$run"
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -q '^claimed    13312M' <<<"$fo" || fail "MEM_OVERCOMMIT_PCT=200 must not shrink slot 2's claim: $fo"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: fleet holds 22016M of 24576M' <<<"$fo" ||
+		fail "MEM_OVERCOMMIT_PCT=200 let slot 3 into room a running VM still claims: $fo"
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nRUN_DIR='"$run"
+	rm "$run/.slot-2.claim"
 	grep -q '^host       40000M available, 4800M kept for other services, pressure 0% (limit 10%)$' <<<"$fo" ||
 		fail "fleet does not report the host's memory: $fo"
 
@@ -232,11 +245,28 @@ $verify_out"
 	host_mem 14000 0.00
 	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
 	grep -Eq '^3 +24576M +0M +waiting 2[0-9]s: fleet holds' <<<"$fo" || fail "slot 3 should still wait for its own room: $fo"
+	grep -Eq '^2 +16384M +3072M +idle gha-test-2-ef01$' <<<"$fo" ||
+		fail "idle slot 2 gave way to a slot 3 the host cannot fit even with it gone: $fo"
 	grep -Eq '^5 +8192M +0M +waiting 1[0-9]s$' <<<"$fo" || fail "slot 5 should not queue behind a slot 3 the host cannot fit: $fo"
 	host_mem 40000 0.00
 	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
 	grep -Eq '^5 +8192M +0M +waiting 1[0-9]s: queued behind slot 3$' <<<"$fo" ||
 		fail "slot 5 should queue behind a slot 3 that fits once the fleet drains: $fo"
+	grep -Eq '^2 +16384M +3072M +idle gha-test-2-ef01; giving way: slot 3 \(24576M\) is waiting for memory: fleet holds' <<<"$fo" ||
+		fail "idle slot 2 should give its memory to the bigger slot 3 waiting for it: $fo"
+	# An on-demand waiter has a queued job; an always-on one only wants a spare
+	# runner. The on-demand slot goes first even though it queued later, and
+	# an idle runner smaller than it gives way.
+	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_5=12G\nON_DEMAND_5=1\nRUNNER_LABELS_EXTRA_5=large\nRUN_DIR='"$run"
+	echo "$now 8192" >"$run/.slot-2.claim"
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$cg "$gha" fleet)" || fail "fleet exited non-zero"
+	grep -Eq '^5 +12288M +0M +waiting 1[0-9]s: fleet holds 13824M of 24576M; this slot needs 12288M free$' <<<"$fo" ||
+		fail "on-demand slot 5 should head the queue and wait only for memory: $fo"
+	grep -Eq '^3 +8192M +0M +waiting 2[0-9]s: queued behind slot 5$' <<<"$fo" ||
+		fail "always-on slot 3 should queue behind the on-demand slot 5: $fo"
+	grep -Eq '^2 +8192M +3072M +idle gha-test-2-ef01; giving way: slot 5 \(12288M\) is waiting for memory' <<<"$fo" ||
+		fail "idle slot 2 should give way to the on-demand slot 5 behind an always-on waiter: $fo"
+	rm "$run/.slot-2.claim"
 	fleet_env <<<$'FLEET_MEM=24G\nVM_MEM_1=16G\nVM_MEM_2=16G\nRUN_DIR='"$run"
 	host_mem 13000 0.00
 	host_mem 40000 25.31
@@ -299,12 +329,160 @@ $verify_out"
 	wait "$mgpid" || fail "memguard did not exit cleanly on TERM"
 	[[ "$(<"$sl/memory.high")" == $((20480 * 1048576)) ]] || fail "memguard left the fleet pinned on stop: $(<"$sl/memory.high")"
 	[[ "$(<"$sl/memory.max")" == $((22528 * 1048576)) ]] || fail "memguard did not restore MemoryMax on stop: $(<"$sl/memory.max")"
+	# Host under its floor while the fleet's swap is full: a MemoryHigh below
+	# the 16384M the guests hold could reclaim nothing and would freeze them,
+	# and one right at it would throttle every page they add before the next
+	# tick, so it keeps 512M of headroom.
+	mg_swap() { # memory.swap.current MiB, host SwapFree MiB
+		echo $((3072 * 1048576)) >"$sl/memory.swap.max"
+		echo $(($1 * 1048576)) >"$sl/memory.swap.current"
+		printf 'SwapFree:       %s kB\n' $(($2 * 1024)) >>"$proc/meminfo"
+		echo max >"$sl/memory.high"
+	}
+	echo $((18432 * 1048576)) >"$sl/memory.current"
+	host_mem 4000 0.00
+	mg_swap 3072 8000
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((16896 * 1048576)) ]] || fail "memguard high should be the 16384M held with no swap left + 512M headroom: $(<"$sl/memory.high")"
+	[[ "$(<"$sl/memory.max")" == $((17632 * 1048576)) ]] || fail "memguard max should still follow the host (15584M + 2048M): $(<"$sl/memory.max")"
+	# The live run that froze: MemoryHigh 123M under what the fleet held, which
+	# the 256M step alone would have left in place.
+	echo $(((16384 - 123) * 1048576)) >"$sl/memory.high"
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((16896 * 1048576)) ]] || fail "memguard left MemoryHigh under memory the fleet cannot give back: $(<"$sl/memory.high")"
+	host_mem 4000 0.00
+	mg_swap 2560 8000
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((16384 * 1048576)) ]] || fail "memguard high should be held minus the slice's 512M swap headroom, plus 512M: $(<"$sl/memory.high")"
+	host_mem 4000 0.00
+	mg_swap 0 300
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((16596 * 1048576)) ]] || fail "memguard swap headroom should be bounded by host SwapFree (16384M - 300M + 512M): $(<"$sl/memory.high")"
+	echo $((22528 * 1048576)) >"$sl/memory.current"
+	host_mem 1000 0.00
+	mg_swap 3072 8000
+	mg_once || fail "memguard --once exited non-zero"
+	[[ "$(<"$sl/memory.high")" == $((18728 * 1048576)) ]] || fail "memguard high must not exceed max, so the OOM killer still bounds the fleet: $(<"$sl/memory.high")"
+	[[ "$(<"$sl/memory.max")" == $((18728 * 1048576)) ]] || fail "memguard max should be 16680M + 2048M: $(<"$sl/memory.max")"
+	rm -f "$sl/memory.swap.max" "$sl/memory.swap.current"
 	fleet_env <<<$'FLEET_MEM=24G\nHOST_MEM_FLOOR=0'
 	if mg_once; then fail "memguard ran with HOST_MEM_FLOOR=0"; fi
 	fleet_env <<<'FLEET_MEM=off'
 	if mg_once; then fail "memguard ran with FLEET_MEM=off"; fi
 	unset GHA_PROC_ROOT
-	pass "memguard follows the host, keeps its step, caps, floors, and restores on stop"
+	pass "memguard follows the host, keeps its step, caps, floors, never freezes a fleet with no swap left, and restores on stop"
+
+	# On-demand slots: a fake curl serves GitHub's Actions API from fixture
+	# files keyed by request path, with etags, so the queue walk, the label
+	# match and the 304 revalidation run against the real parsing code.
+	local dm=$fl/demand
+	install -d "$dm/bin" "$dm/api" "$dm/run"
+	cat >"$dm/bin/curl" <<SH
+#!/bin/bash
+cat >/dev/null
+hdr="" url="" inm=""
+while ((\$#)); do
+	case "\$1" in
+	-D) hdr="\$2"; shift ;;
+	-H) [[ "\$2" == If-None-Match:* ]] && inm="\${2#If-None-Match: }"; shift ;;
+	-w | -X | -d | --max-time | --retry | --retry-delay | --proto | --connect-timeout) shift ;;
+	https://*) url="\$1" ;;
+	esac
+	shift
+done
+path="\${url#https://api.github.com}"
+echo "\$path\${inm:+ inm}" >>"$dm/log"
+f="$dm/api/\$(printf '%s' "\$path" | sha256sum | cut -c1-16)"
+[[ -e "\$f" ]] || { printf '{"message":"Not Found"}\n404'; exit 0; }
+code=200
+[[ -e "\$f.code" ]] && code="\$(<"\$f.code")"
+etag="\"\$(sha256sum "\$f" | cut -c1-12)\""
+[[ -n "\$hdr" ]] && printf 'HTTP/2 %s\r\netag: %s\r\n\r\n' "\$code" "\$etag" >"\$hdr"
+[[ "\$code" == 200 && "\$inm" == "\$etag" ]] && { printf '\n304'; exit 0; }
+cat "\$f"
+printf '\n%s' "\$code"
+SH
+	chmod +x "$dm/bin/curl"
+	gh_api() { printf '%s' "$2" >"$dm/api/$(printf '%s' "$1" | sha256sum | cut -c1-16)"; }
+	gh_api '/orgs/example-org/repos?type=all&per_page=100&page=1' \
+		'[{"full_name":"example-org/a","archived":false},{"full_name":"example-org/old","archived":true}]'
+	gh_api '/repos/example-org/a/actions/runs?status=queued&per_page=100' '{"workflow_runs":[{"id":7}]}'
+	gh_api '/repos/example-org/a/actions/runs?status=in_progress&per_page=100' \
+		'{"workflow_runs":[{"id":8,"updated_at":"2026-01-01T00:00:00Z"}]}'
+	gh_api '/repos/example-org/a/actions/runs/7/jobs?filter=latest&per_page=100' \
+		'{"jobs":[{"id":70,"status":"queued","labels":["self-hosted","linux"]}]}'
+	gh_api '/repos/example-org/a/actions/runs/8/jobs?filter=latest&per_page=100' \
+		'{"jobs":[{"id":80,"status":"in_progress","labels":["self-hosted","large"]},{"id":81,"status":"queued","labels":["self-hosted","large","gpu"]}]}'
+	local dcfg=$'FLEET_MEM=24G\nVM_MEM_1=16G\nRUNNER_LABELS_EXTRA_1=large\nON_DEMAND_1=1\nAUTH_MODE=pat\nGITHUB_PAT=test\nRUNNER_LABELS_APPEND_HOST=0\nRUN_DIR='"$dm/run"
+	fleet_env <<<"$dcfg"
+	dm_run() {
+		chmod 0640 "$fl/cfg.env"
+		PATH="$dm/bin:$PATH" GHA_CONFIG=$fl/cfg.env GHA_DEMAND_CACHE=$dm/run/.demand-cache "$gha" demand 2>&1
+	}
+	local dout
+	dout="$(dm_run)" || fail "demand exited non-zero: $dout"
+	[[ "$dout" == "slot 1: idle; no queued job asks for large" ]] ||
+		fail "a job for any runner, a running one and one needing a label the slot lacks must not start it: $dout"
+	grep -q '/repos/example-org/old/' "$dm/log" && fail "demand walked an archived repo"
+	gh_api '/repos/example-org/a/actions/runs/8/jobs?filter=latest&per_page=100' \
+		'{"jobs":[{"id":80,"status":"in_progress","labels":["self-hosted","large"]},{"id":82,"status":"queued","labels":["self-hosted","Large"]}]}'
+	: >"$dm/log"
+	dout="$(dm_run)" || fail "demand exited non-zero: $dout"
+	[[ "$dout" == "slot 1: idle; no queued job asks for large" ]] ||
+		fail "jobs of a run whose updated_at did not move should come from the cache: $dout"
+	grep -q '/runs/8/jobs' "$dm/log" && fail "demand refetched the jobs of an unchanged run: $(<"$dm/log")"
+	gh_api '/repos/example-org/a/actions/runs?status=in_progress&per_page=100' \
+		'{"workflow_runs":[{"id":8,"updated_at":"2026-01-01T00:01:00Z"}]}'
+	: >"$dm/log"
+	dout="$(dm_run)" || fail "demand exited non-zero: $dout"
+	[[ "$dout" == "slot 1: wanted by job 82 in example-org/a" ]] || fail "a queued job asking for large should start slot 1: $dout"
+	grep -q '^/repos/example-org/a/actions/runs?status=queued&per_page=100 inm$' "$dm/log" ||
+		fail "demand did not revalidate its cached listing: $(<"$dm/log")"
+	: >"$dm/log"
+	dout="$(dm_run)" || fail "demand exited non-zero: $dout"
+	[[ "$dout" == "slot 1: wanted by job 82 in example-org/a" ]] || fail "a 304 should answer from the cached listing: $dout"
+	fleet_env <<<"${dcfg/RUN_DIR=$dm\/run/RUN_DIR=$dm/fresh}"
+	chmod 0640 "$fl/cfg.env"
+	dout="$(PATH="$dm/bin:$PATH" GHA_CONFIG=$fl/cfg.env "$gha" demand 2>&1)" || fail "demand as root exited non-zero: $dout"
+	[[ ! -e "$dm/fresh" ]] || fail "demand run as root created RUN_DIR (and a root-owned cache) the supervisors need to own"
+	fleet_env <<<"$dcfg"
+	chmod 0640 "$fl/cfg.env"
+	dout="$(PATH="$dm/bin:$PATH" GHA_CONFIG=$fl/cfg.env "$gha" doctor 2>&1)" || :
+	grep -q '^queued-job access (on-demand slot 1): OK$' <<<"$dout" ||
+		fail "doctor did not pass a readable Actions queue: $(grep -A2 queued-job <<<"$dout")"
+	echo 502 >"$dm/api/$(printf '%s' '/repos/example-org/a/actions/runs?status=queued&per_page=100' | sha256sum | cut -c1-16).code"
+	dout="$(PATH="$dm/bin:$PATH" GHA_CONFIG=$fl/cfg.env "$gha" doctor 2>&1)" || :
+	grep -q '^queued-job access (on-demand slot 1): FAIL: the PAT needs Actions read' <<<"$dout" ||
+		fail "doctor did not flag an unreadable Actions queue: $(grep -A2 queued-job <<<"$dout")"
+	echo 502 >"$dm/api/$(printf '%s' '/repos/example-org/a/actions/runs?status=queued&per_page=100' | sha256sum | cut -c1-16).code"
+	if dout="$(dm_run)"; then fail "a failed listing read as an empty queue: $dout"; fi
+	grep -q 'could not read the Actions queue' <<<"$dout" || fail "a failed listing was not reported: $dout"
+	gh_api '/repos/example-org/b/actions/runs?status=queued&per_page=100' '{"workflow_runs":[]}'
+	gh_api '/repos/example-org/b/actions/runs?status=in_progress&per_page=100' '{"workflow_runs":[]}'
+	fleet_env <<<"$dcfg"$'\nDEMAND_REPOS=b'
+	: >"$dm/log"
+	dout="$(dm_run)" || fail "demand exited non-zero with DEMAND_REPOS: $dout"
+	[[ "$dout" == "slot 1: idle; no queued job asks for large" ]] || fail "DEMAND_REPOS=b should watch only b: $dout"
+	grep -qE '/orgs/|/repos/example-org/a/' "$dm/log" && fail "DEMAND_REPOS=b still listed other repos: $(<"$dm/log")"
+
+	: >"$dm/run/.slot-1.lock"
+	flock "$dm/run/.slot-1.lock" sleep 60 &
+	local dholder=$!
+	sleep 1
+	fo="$(GHA_CONFIG=$fl/cfg.env GHA_CGROUP_ROOT=$fl/cg "$gha" fleet)" || fail "fleet exited non-zero"
+	kill "$dholder"
+	wait "$dholder" || :
+	grep -Eq '^1 +16384M +[0-9]+M +on demand: no VM until a queued job asks for large$' <<<"$fo" ||
+		fail "fleet should show an idle on-demand slot: $fo"
+
+	fleet_env <<<$'FLEET_MEM=24G\nON_DEMAND_1=1\nAUTH_MODE=pat\nGITHUB_PAT=test'
+	if dout="$(dm_run)"; then fail "ON_DEMAND_1 without RUNNER_LABELS_EXTRA_1 accepted"; fi
+	grep -q 'ON_DEMAND_1 needs RUNNER_LABELS_EXTRA_1' <<<"$dout" || fail "wrong refusal for ON_DEMAND without labels: $dout"
+	fleet_env <<<"$dcfg"$'\nON_DEMAND_1=yes'
+	if dout="$(dm_run)"; then fail "ON_DEMAND_1=yes accepted"; fi
+	fleet_env <<<"$dcfg"$'\nDEMAND_POLL_SEC=0'
+	if dout="$(dm_run)"; then fail "DEMAND_POLL_SEC=0 accepted"; fi
+	pass "on-demand slots start only for a queued job asking for their labels"
 
 	# restart: an idle runner is not a running job. Slots 2 (idle) and 3 (a
 	# job's run dir left by a killed supervisor) restart at once, slot 1 once
@@ -473,6 +651,23 @@ $nft_out"
 	[[ -n "$labels" && ",$labels," != *,kvm,* ]] || fail "arm64 host advertises kvm: $labels"
 	pass "kvm label follows NESTED_VIRT on x64 only"
 
+	# A job asking for `standard` must never land on the large slot, so only the
+	# slots without RUNNER_LABELS_EXTRA_<n> carry it.
+	local sl=/tmp/sl.env
+	{
+		cat /tests/config.test.env
+		printf 'RUNNER_LABELS_APPEND_HOST=0\n'
+	} >"$sl"
+	labels="$(GHA_CONFIG=$sl "$gha" labels 1)"
+	[[ "$labels" == "docker,ephemeral,large,linux,self-hosted,vm,x64" ]] || fail "large slot labels wrong: $labels"
+	labels="$(GHA_CONFIG=$sl "$gha" labels 2)"
+	[[ "$labels" == "docker,ephemeral,linux,self-hosted,standard,vm,x64" ]] || fail "small slot labels wrong: $labels"
+	printf 'RUNNER_LABELS_STANDARD=\n' >>"$sl"
+	labels="$(GHA_CONFIG=$sl "$gha" labels 2)"
+	[[ "$labels" == "docker,ephemeral,linux,self-hosted,vm,x64" ]] || fail "empty RUNNER_LABELS_STANDARD still added a label: $labels"
+	if GHA_CONFIG=$sl "$gha" labels 0 2>/dev/null; then fail "labels accepted slot 0"; fi
+	pass "only the slots without extra labels carry the standard label"
+
 	printf 'SCOPE=org\nGITHUB_ORG=x\nAUTH_MODE=app\nRUNNER_VERSION=2.336.0\nGHA_UID=999\nAUTOTUNE=0\nVM_MEM=lots\n' >/tmp/bad.env
 	if GHA_CONFIG=/tmp/bad.env GHA_SYSTEMD_DIR=/tmp/bad GHA_NFT_CONF=/tmp/bad/n.conf "$gha" render 2>/dev/null; then
 		fail "render accepted VM_MEM=lots"
@@ -485,6 +680,53 @@ $nft_out"
 		fail "render accepted a non-numeric RUNNER_GROUP_ID"
 	fi
 	pass "bare VM_MEM normalized; non-numeric RUNNER_GROUP_ID refused"
+
+	# --- pinned guest hosts ---------------------------------------------------
+	# Real lookups against dns.google: the point is what Google answers.
+	local pin=/tmp/pin.env pins
+	[[ "$("$gha" config GUEST_PIN_HOSTS)" == dl.google.com ]] || fail "GUEST_PIN_HOSTS does not default to dl.google.com"
+	{
+		cat /tests/config.test.env
+		printf 'GUEST_PIN_HOSTS=\n'
+	} >"$pin"
+	[[ "$(GHA_CONFIG=$pin "$gha" config GUEST_PIN_HOSTS)" == "" ]] || fail "an empty GUEST_PIN_HOSTS did not turn pinning off"
+	[[ "$(GHA_CONFIG=$pin "$gha" pins)" == *"GUEST_PIN_HOSTS is empty"* ]] || fail "pins with pinning off should say so"
+	{
+		cat /tests/config.test.env
+		printf 'GUEST_PIN_HOSTS="dl.google.com, maven.google.com"\n'
+	} >"$pin"
+	pins="$(GHA_CONFIG=$pin "$gha" pins)" || fail "pins failed for dl.google.com, maven.google.com"
+	grep -Eq '^[0-9]+(\.[0-9]+){3} dl\.google\.com$' <<<"$pins" || fail "no IPv4 pin for dl.google.com: $pins"
+	grep -Eq '^[0-9]+(\.[0-9]+){3} maven\.google\.com$' <<<"$pins" || fail "no IPv4 pin for maven.google.com: $pins"
+	! grep -Evq '^[0-9]+(\.[0-9]+){3} (dl|maven)\.google\.com$' <<<"$pins" || fail "pins printed a malformed line: $pins"
+	# The seed must stay one valid cloud-config with or without pins: a broken
+	# document makes cloud-init skip runcmd, so the runner never starts.
+	GHA_CONFIG=$pin "$gha" seed | python3 -c '
+import base64, sys, yaml
+d = yaml.safe_load(sys.stdin)
+assert d["runcmd"] == [["/usr/local/bin/gha-job.sh"]], d.get("runcmd")
+files = {f["path"]: f for f in d["write_files"]}
+assert base64.b64decode(files["/run/gha-jit"]["content"]) == b"REDACTED-JIT-CONFIG"
+hosts = files["/etc/hosts"]
+assert hosts["append"] is True, hosts
+text = base64.b64decode(hosts["content"]).decode()
+assert " dl.google.com" in text and " maven.google.com" in text, text
+' || fail "seed with pins is not the cloud-config the guest expects: $(GHA_CONFIG=$pin "$gha" seed)"
+	GHA_CONFIG=/tests/config.test.env GUEST_PIN_HOSTS='' "$gha" seed | python3 -c '
+import sys, yaml
+d = yaml.safe_load(sys.stdin)
+assert d["runcmd"] == [["/usr/local/bin/gha-job.sh"]], d.get("runcmd")
+assert [f["path"] for f in d["write_files"]] == ["/run/gha-jit", "/run/gha-env"], d["write_files"]
+' || fail "seed without pins is not the cloud-config the guest expects"
+	printf 'GUEST_PIN_HOSTS=no-such-host.invalid\n' >>"$pin"
+	if GHA_CONFIG=$pin "$gha" pins >/dev/null 2>&1; then
+		fail "pins succeeded although no host resolved"
+	fi
+	printf 'GUEST_PIN_HOSTS="dl.google.com;reboot"\n' >>"$pin"
+	if GHA_CONFIG=$pin GHA_SYSTEMD_DIR=/tmp/pinbad GHA_NFT_CONF=/tmp/pinbad/n.conf "$gha" render 2>/dev/null; then
+		fail "render accepted a GUEST_PIN_HOSTS with shell metacharacters"
+	fi
+	pass "GUEST_PIN_HOSTS resolves through DoH, lands in a valid seed, fails loudly when nothing resolves, refuses junk"
 
 	# --- atomic config editor ------------------------------------------------
 	local c=/tmp/edit.env
@@ -519,6 +761,30 @@ $nft_out"
 		fail "config-set accepted an invalid key"
 	fi
 	pass "config-set/config-unset are atomic, quoted and idempotent"
+
+	# An unprivileged user must be told to use sudo, not shown the defaults
+	# (every slot "stopped" at VM_MEM) as if they were the host's state.
+	local ro=/tmp/ro
+	install -d -m 0700 "$ro"
+	cp /tests/config.test.env "$ro/config.env"
+	local ro_out
+	if ro_out="$(GHA_CONFIG=$ro/config.env setpriv --reuid=65534 --regid=65534 --clear-groups "$gha" fleet 2>&1)"; then
+		fail "fleet ran on defaults with an unreadable config: $ro_out"
+	fi
+	grep -q 'not readable by .*; run this command with sudo' <<<"$ro_out" || fail "wrong refusal for an unreadable config: $ro_out"
+	chmod 0711 "$ro"
+	chmod 0600 "$ro/config.env"
+	if ro_out="$(GHA_CONFIG=$ro/config.env setpriv --reuid=65534 --regid=65534 --clear-groups "$gha" config 2>&1)"; then
+		fail "config ran on defaults with an unreadable config file: $ro_out"
+	fi
+	grep -q 'run this command with sudo' <<<"$ro_out" || fail "wrong refusal for an unreadable config file: $ro_out"
+	if ro_out="$(GHA_CONFIG=$ro/config.env setpriv --reuid=65534 --regid=65534 --clear-groups "$gha" status 2>&1)"; then
+		fail "status ran with an unreadable config: $ro_out"
+	fi
+	grep -q 'run this command with sudo' <<<"$ro_out" || fail "status blamed a missing config instead of asking for sudo: $ro_out"
+	GHA_CONFIG=$ro/none.env setpriv --reuid=65534 --regid=65534 --clear-groups "$gha" config RUNNER_LABELS >/dev/null ||
+		fail "a missing config must still fall back to the defaults"
+	pass "an unreadable config asks for sudo instead of showing defaults"
 
 	# --- usage ---------------------------------------------------------------
 	local u
