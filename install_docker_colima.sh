@@ -11,9 +11,12 @@ set -euo pipefail
 #   chmod +x install_docker.sh
 #   ./install_docker.sh
 #
+# The maintained macOS installer is llm-tools/install_colima_docker.sh, which also
+# supervises the VM across sleep and wake; this one keeps the same sizing.
+#
 # Options (macOS/Colima only):
-#   COLIMA_CPU=4          CPU cores for the VM       (default: 2)
-#   COLIMA_MEMORY=8       Memory in GB for the VM    (default: 4)
+#   COLIMA_CPU=4          CPU cores for the VM       (default: half the host's, at most 8)
+#   COLIMA_MEMORY=8       Memory cap in GB           (default: a quarter of RAM, at most 16)
 #   COLIMA_DISK=60        Disk size in GB for the VM (default: 60)
 #   COLIMA_VMTYPE=vz      VM type: vz or qemu        (default: vz)
 #
@@ -21,8 +24,21 @@ set -euo pipefail
 #   COLIMA_CPU=4 COLIMA_MEMORY=8 ./install_docker.sh
 # ──────────────────────────────────────────────────────────────────────────────
 
-COLIMA_CPU="${COLIMA_CPU:-2}"
-COLIMA_MEMORY="${COLIMA_MEMORY:-4}"
+# Memory is a cap, not a reservation: a vz VM backs only the pages its guest touches but
+# never hands them back, so the host footprint grows to the full cap and stays there
+# until the VM restarts.
+default_colima_cpu=2
+default_colima_memory=4
+if [ "$(uname -s)" = "Darwin" ]; then
+    default_colima_cpu=$(( $(sysctl -n hw.ncpu) / 2 ))
+    (( default_colima_cpu > 8 )) && default_colima_cpu=8
+    (( default_colima_cpu < 2 )) && default_colima_cpu=2
+    default_colima_memory=$(( $(sysctl -n hw.memsize) / 4294967296 ))
+    (( default_colima_memory > 16 )) && default_colima_memory=16
+    (( default_colima_memory < 4 )) && default_colima_memory=4
+fi
+COLIMA_CPU="${COLIMA_CPU:-$default_colima_cpu}"
+COLIMA_MEMORY="${COLIMA_MEMORY:-$default_colima_memory}"
 COLIMA_DISK="${COLIMA_DISK:-60}"
 COLIMA_VMTYPE="${COLIMA_VMTYPE:-vz}"
 

@@ -163,7 +163,15 @@ if [[ $basicChoice == "y" ]]; then
 
 	# Install Docker via Colima (lightweight Docker runtime for macOS)
 	brew install docker colima docker-compose
-	colima start
+	# Memory is a cap the VM grows into and keeps until it restarts: a quarter of RAM, at
+	# most 16 GB, and half the CPUs, at most 8, as install_docker_colima.sh sizes it.
+	colima_cpu=$(( $(sysctl -n hw.ncpu) / 2 ))
+	(( colima_cpu > 8 )) && colima_cpu=8
+	(( colima_cpu < 2 )) && colima_cpu=2
+	colima_memory=$(( $(sysctl -n hw.memsize) / 4294967296 ))
+	(( colima_memory > 16 )) && colima_memory=16
+	(( colima_memory < 4 )) && colima_memory=4
+	colima start --cpu "$colima_cpu" --memory "$colima_memory"
 
 fi
 
