@@ -57,6 +57,7 @@ VM_MEM=8G
 VM_DISK=80G
 #VM_MEM_1=16G          # slot 1 runs a bigger VM...
 #RUNNER_LABELS_EXTRA_1=large   # ...that workflows reach with runs-on: [self-hosted, large]
+#ON_DEMAND_1=1         # ...booted only while a queued job asks for that label
 #FLEET_MEM=auto        # memory all VMs share; auto = RAM - HOST_RESERVE_GB
 #MEM_OVERCOMMIT_PCT=100
 #HOST_MEM_FLOOR=auto   # MemAvailable the VMs always leave to other services; 0 = off
@@ -72,7 +73,7 @@ NESTED_VIRT=0
 
 | Profile | Machine | Slots |
 |---|---|---|
-| `services.env` | 24 vCPU / 46G, QEMU guest, runs llama-server + minio + containers | 5: one 16G + four 8G in a 24G shared budget |
+| `services.env` | 24 vCPU / 46G, QEMU guest, runs llama-server + minio + containers | 5: one 12G + four 8G in a 24G shared budget |
 
 A dedicated 128G box needs no file here: autotune already sizes it to roughly
 `(128 − reserve) / 8` = 15 slots. Add one only to pin `MAX_SLOTS` or to change

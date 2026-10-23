@@ -37,12 +37,17 @@ takes about two minutes.
 1. **GitHub App name** — anything unique, e.g. `gha-vm-runners`.
 2. **Homepage URL** — required by the form but never used. Any URL.
 3. **Webhook** — untick **Active**. This app receives nothing.
-4. **Permissions** — exactly one, and it differs by scope:
+4. **Permissions** — one, and it differs by scope:
 
    | Scope | Permission | Level |
    |---|---|---|
    | org | Organization permissions → **Self-hosted runners** | Read and write |
    | repo | Repository permissions → **Administration** | Read and write |
+
+   With an on-demand slot (`ON_DEMAND_<n>=1`, see [On-demand slots](#on-demand-slots)),
+   also Repository permissions → **Actions** → Read-only, so the slot can see
+   queued jobs. `setup.sh` makes a bigger slot 1 one, and the `services`
+   profile has one. `sudo gha-vm doctor` checks it (`queued-job access`).
 
    Leave everything else at *No access*. Getting this wrong is the most common
    failure: the app installs fine and then every token mint returns 422.
@@ -179,16 +184,18 @@ sudo gha-vm undrain 3
 sudo gha-vm restart all        # drain every slot, restart its unit, undrain
 ```
 
-`restart` is what to run after editing `gha-vm.sh` and re-running `install`.
-It drains every slot up front, restarts idle ones at once and busy ones as
+`install` restarts the slots that are idle right then, so their next job
+already runs the new script and config; busy slots are left to finish.
+`restart` is what to run when the unit itself changed and the busy slots must
+follow too. It drains every slot up front, restarts idle ones at once and busy ones as
 their job finishes (up to `STOP_GRACE_SEC`); `gha-vm fleet` shows which is
 which. An idle slot's VM is stopped by `restart` itself after its runner is
 deregistered, so a supervisor still running an older script never holds the
 restart for its grace period. `setup.sh` offers this restart when it finds
 slots already running.
 The supervisor also notices when its own script file changes on disk and
-re-execs itself between jobs, so a plain `install` is picked up without a
-restart; `restart` only matters when the unit file itself changed.
+re-execs itself between jobs, so a busy slot picks up a plain `install` once
+its job ends.
 
 ### Host updates
 
@@ -236,17 +243,40 @@ FLEET_MEM=24G
 VM_MEM=8G
 VM_MEM_1=16G                  # slot 1 is the big one
 RUNNER_LABELS_EXTRA_1=large   # runs-on: [self-hosted, large]
+                              # the other slots: [self-hosted, standard]
 MEM_OVERCOMMIT_PCT=200        # capacity may plan 16G + 4 x 8G into 24G
 ```
 
-A slot registers a runner only when what the VMs really hold (resident memory
-and swap, not page cache) plus that slot's full size fits in the budget.
-Otherwise it waits, first come first served, and says why in the journal and in
-`gha-vm fleet`. Nothing is registered while it waits, so GitHub cannot hand it a
-job the host has no room for. A VM that has just started counts at its full size
-for 5 minutes, which stops several slots that free up together from all taking
-the same gap. Idle guests hand unused pages back through `virtio-balloon`
-free-page-reporting, so light jobs leave room for more slots.
+GitHub hands a job to any runner that holds every label the job asks for, so
+a job asking `runs-on: [self-hosted, linux]` can land on the big slot and hold
+it for a small job. Every slot without `RUNNER_LABELS_EXTRA_<n>` therefore also
+registers with `standard` (`RUNNER_LABELS_STANDARD`; empty turns it off): small
+jobs ask for `[self-hosted, standard]`, big ones for `[self-hosted, large]`.
+`gha-vm labels <slot>` prints what a slot registers with.
+
+An idle runner holds its full size until it takes a job or reaches
+`MAX_LIFETIME`, so a big slot waiting for memory would wait hours behind small
+runners with no job. Instead, once a slot bigger than an idle runner heads the
+queue and is still held out after 30 s, the idle runner deregisters, stops,
+and queues again behind it (`make-way` in the journal; `gha-vm fleet` shows it
+as `giving way`). A runner never gives way to a slot no bigger than itself, nor
+to one the host could not fit even with every VM gone.
+
+A slot registers a runner only when every running VM at its full size (or what
+it really holds, resident memory and swap but not page cache, if that is more)
+plus that slot's full size fits in the budget.
+Otherwise it waits, first come first served except that an on-demand slot
+(which waits only while a queued job asks for it) goes before always-on ones,
+and says why in the journal and in `gha-vm fleet`. A waiting slot too big to start even if every running VM exited
+(larger than the live ceiling, or than the host can spare) does not hold back
+smaller slots that fit. Nothing is registered while it waits, so GitHub cannot hand it a
+job the host has no room for. An idle runner holds little, but the job it can
+pick up at any moment grows it to full size, and the host cannot take guest
+RAM back: counting only what idle VMs hold would admit more than the fleet
+holds, and when their jobs land together the kernel OOM-kills VMs mid-job.
+`MEM_OVERCOMMIT_PCT` adds slots, never room: the extra ones wait here until
+running VMs exit. A big always-on slot holds its full size even while idle,
+which is why `setup.sh` makes the large slot on-demand (below).
 
 Admission cannot stop a VM that is already running from growing into its full
 size. That growth is bounded by the kernel. All slot units run in
@@ -301,8 +331,13 @@ fleet gives memory back instead of the host swapping itself to a standstill:
   what the VMs hold in anonymous memory plus the host's `MemAvailable` above
   the floor, never past the installed ceiling, with `MemoryMax` the usual
   margin above. When another service grows, running jobs are throttled and,
-  past `MemoryMax`, one VM is OOM-killed while the host keeps its floor. As
-  memory frees up the limits rise back; stopping the service restores them.
+  past `MemoryMax`, one VM is OOM-killed while the host keeps its floor.
+  `MemoryHigh` never drops below what the VMs hold minus the swap they can
+  still use (`MemorySwapMax` headroom, bounded by host `SwapFree`). Below that
+  line the kernel can reclaim nothing and throttles every guest indefinitely
+  without ever reaching `MemoryMax`, so jobs freeze and runners lose contact
+  with GitHub. As memory frees up the limits rise back; stopping the service
+  restores them.
 
 `HOST_MEM_FLOOR=0` turns all three off. They apply with `FLEET_MEM=off` too,
 except memguard, which needs a ceiling to move.
@@ -313,6 +348,55 @@ journalctl -u gha-vm-memguard         # every time the ceiling moves by 1 GB or 
 journalctl -u 'gha-vm@*' | grep shed  # idle runners given back
 ```
 
+### On-demand slots
+
+A big slot that boots and registers like the others holds its full size
+whether or not any job needs it. With `ON_DEMAND_<n>=1` the slot holds no VM
+and no runner until a queued job asks for one of its `RUNNER_LABELS_EXTRA_<n>`
+labels:
+
+```bash
+VM_MEM_1=16G
+RUNNER_LABELS_EXTRA_1=large   # runs-on: [self-hosted, large]
+ON_DEMAND_1=1
+```
+
+Every `DEMAND_POLL_SEC` (30) the slot lists the queued and in-progress workflow
+runs of the watched repos and looks for a queued job whose labels its runner
+would all carry, one of them from `RUNNER_LABELS_EXTRA_<n>`. A job without one
+of those labels never starts it. When it finds one, it queues for memory like
+any slot, boots, and registers; GitHub hands it the job. If the job goes
+elsewhere or is cancelled while the slot waits for memory, the slot goes back
+to idle. A booted VM that sits `DEMAND_IDLE_SEC` (180) without a job and with
+no other queued job for it is deregistered and stopped, and for the next hour
+the job it booted for does not start it again. That covers a job from a repo
+the runner group excludes, which would otherwise boot the VM over and over.
+
+The watched repos are every unarchived repo the credentials reach, or
+`DEMAND_REPOS` (comma-separated names) when set; in repo scope, the repo. Each
+poll lists the queued and in-progress runs of every watched repo with
+`If-None-Match`; GitHub does not count an unchanged listing (HTTP 304) against
+the rate limit. A run's jobs are fetched only when the run's `updated_at` moved,
+or every 5 minutes. On an org with many busy repos, set `DEMAND_REPOS` to the
+ones whose workflows ask for the on-demand label: every request shares the
+rate limit that registering runners also needs.
+
+A `large` job waits up to `DEMAND_POLL_SEC` plus the boot, about 15-30 s,
+longer than on a standing runner; one that becomes ready inside a run already
+in progress may be seen up to 5 minutes late if the run's `updated_at` did not
+move. While the VM is up, an
+older queued job for any runner may land on it first; the slot then boots again
+for the `large` job when that one finishes.
+
+The credentials need to read Actions: the app's Repository permissions →
+**Actions** → Read-only (accept the re-issued installation request), or a PAT
+with `repo` (classic) or Actions: read (fine-grained).
+
+```bash
+gha-vm demand     # which queued job each on-demand slot would start for now
+gha-vm fleet      # an idle one shows "on demand: no VM until a queued job asks for large"
+```
+
 ### The two plans
 
 | | dedicated CI box | `services` |
@@ -321,7 +405,7 @@ journalctl -u 'gha-vm@*' | grep shed  # idle runners given back
 | already resident | ~nothing | ~18 GB (llama-server, minio, clamd, containers) |
 | autotuned reserve | ~8 GB | ~23 GB |
 | per slot | 4 vCPU / 8 GB / 30 GB | 4 vCPU / 8 GB / 30 GB |
-| **slots** | **~15**, memory-bound | **5**, 16G + 4 × 8G at 200% of `FLEET_MEM=24G` |
+| **slots** | **~15**, memory-bound | **5**, 4 × 8G plus a 12G `large` slot booted on demand, at 200% of `FLEET_MEM=24G` |
 | profile file | none needed | `profiles/services.env` |
 
 The dedicated box needs no profile — autotune already lands on the right
@@ -547,6 +631,18 @@ call is pinned to HTTPS with TLS 1.2 or later.
 
 Re-run `sudo gha-vm image` after changing any of these; they are baked in.
 
+`GUEST_PIN_HOSTS` is the exception: it is resolved for every VM and needs no
+rebuild. Each listed host is looked up through Google's DNS-over-HTTPS with no
+client location and written into the guest's `/etc/hosts`, which steers jobs
+around a CDN edge that is broken for this network. The case it exists for:
+on Google Fiber, `dl.google.com` (Android SDK packages and Google's Maven repo)
+can map to an ISP-embedded cache that answers 502 after ~20 s or stalls a
+download after a couple of MiB, while Google's regular edges serve the same
+file in a second. It defaults to `dl.google.com`; set it empty to pin
+nothing. `gha-vm pins` prints what the next VM would get, and `gha-vm seed` the whole cloud-init user-data with the JIT config redacted. TLS still
+verifies the name, so a bad answer fails closed. Containers started by a job
+keep Docker's own `/etc/hosts` and are not covered.
+
 `doctor` fails loudly when the repo or org is public: a fork PR on a public repo
 runs attacker-authored code on your hardware. Use a private repo, or restrict
 the runner group to private repos.
@@ -603,7 +699,8 @@ runs-on: [self-hosted, linux, x64, kvm]
 - A slot does not register a runner until its VM fits in the fleet memory
   budget and the host has it to spare (see "Shared fleet memory" and "Sharing
   the host with other services"); an idle runner on a host that runs short is
-  deregistered and logged as `host-memory`. A VM the kernel OOM-kills, because it
+  deregistered and logged as `host-memory`, and one holding memory a bigger
+  waiting slot needs is deregistered and logged as `make-way`. A VM the kernel OOM-kills, because it
   passed its slot's `MemoryMax` or the fleet passed the slice's, is logged as
   `oom-killed` and deregistered. The unit keeps running (`OOMPolicy=continue`)
   and the slot starts a fresh VM.
@@ -657,7 +754,7 @@ fleet accounting are checked against a fixture cgroup tree via
 | `/var/lib/gha-vm/run/<name>/` | one live VM: overlay, seed, UEFI vars, console log |
 | `/var/lib/gha-vm/run/.slot-<n>.drain` | drain flag; the slot idles while it exists |
 | `/var/lib/gha-vm/run/.slot-<n>.wait` | the slot is waiting for fleet memory, since this epoch |
-| `/var/lib/gha-vm/run/.slot-<n>.claim` | memory a just-started VM may still grow into, counted for 5 min |
+| `/var/lib/gha-vm/run/.slot-<n>.claim` | memory a running VM may still grow into, counted until it exits |
 | `/etc/systemd/system/ghavm.slice` | the fleet's shared memory ceiling (`FLEET_MEM`) |
 | `/etc/systemd/system/gha-vm-memguard.service` | lowers that ceiling live while the host is short (`HOST_MEM_FLOOR`) |
 | `/etc/systemd/system/gha-vm@<n>.service.d/50-gha-vm-size.conf` | per-slot `MemoryMax` from `VM_MEM_<n>` |
