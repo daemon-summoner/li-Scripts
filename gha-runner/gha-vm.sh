@@ -30,6 +30,8 @@
 #   gha-vm.sh labels <slot>     labels slot <slot>'s runner registers with
 #   gha-vm.sh memguard [--once] shrink the fleet's memory ceiling to what the host can spare
 #   gha-vm.sh demand            queued jobs each on-demand slot would start for
+#   gha-vm.sh apps              the GitHub Apps (orgs) this host serves; extra ones live in apps.d/
+#   gha-vm.sh bundle [file]     self-extracting copy of this pool's code + config for another host
 #   gha-vm.sh reap | clean [--force]     cleanup
 #
 # Isolation model: the boundary is the VM, not a namespace. Inside the guest the
@@ -43,6 +45,8 @@
 set -Eeuo pipefail
 
 CONFIG="${GHA_CONFIG:-/etc/gha-vm/config.env}"
+# One <name>.env per extra GitHub App the slots also serve; see load_apps.
+APPS_DIR="${GHA_APPS_DIR:-${CONFIG%/*}/apps.d}"
 SELF="$(readlink -f "$0")"
 HERE="$(dirname "$SELF")"
 APIV="2022-11-28"
@@ -388,6 +392,7 @@ load_config_optional() {
 	fi
 	load_profile
 	apply_defaults
+	load_apps
 }
 
 load_config() {
@@ -403,28 +408,174 @@ load_config() {
 	source "$CONFIG"
 	load_profile
 
-	: "${SCOPE:?set SCOPE=org|repo}"
-	: "${AUTH_MODE:?set AUTH_MODE=app|pat}"
 	: "${RUNNER_VERSION:?set RUNNER_VERSION}"
 
 	apply_defaults
+	validate_app_globals "$CONFIG"
+	validate_sizing
+	load_apps
+	local a
+	for a in "${APPS[@]:1}"; do
+		app_use "$a"
+		validate_app_globals "$APPS_DIR/$a.env"
+	done
+	app_use main
+}
 
+# The credential and scope keys of the app currently loaded (app_use), whose
+# file is $1.
+validate_app_globals() {
+	[[ -n "${SCOPE:-}" ]] || die "$1: set SCOPE=org|repo"
+	[[ -n "${AUTH_MODE:-}" ]] || die "$1: set AUTH_MODE=app|pat"
 	case "$SCOPE" in
-	org) : "${GITHUB_ORG:?set GITHUB_ORG when SCOPE=org}" ;;
+	org) [[ -n "${GITHUB_ORG:-}" ]] || die "$1: set GITHUB_ORG when SCOPE=org" ;;
 	repo)
-		: "${GITHUB_REPO:?set GITHUB_REPO=owner/name when SCOPE=repo}"
+		[[ -n "${GITHUB_REPO:-}" ]] || die "$1: set GITHUB_REPO=owner/name when SCOPE=repo"
 		# Repo-scoped runners have no runner groups; the API only accepts 1.
 		RUNNER_GROUP_ID=1
 		;;
-	*) die "SCOPE must be org or repo" ;;
+	*) die "$1: SCOPE must be org or repo" ;;
 	esac
-
 	case "$AUTH_MODE" in
 	app | pat) ;;
-	*) die "AUTH_MODE must be app or pat" ;;
+	*) die "$1: AUTH_MODE must be app or pat" ;;
 	esac
+	validate_app_values "$1: "
+}
 
-	validate_sizing
+# The app keys that have a format; $1 prefixes the message.
+validate_app_values() {
+	[[ "$RUNNER_GROUP_ID" =~ ^[0-9]+$ ]] || die "${1:-}RUNNER_GROUP_ID must be a number (got '$RUNNER_GROUP_ID')"
+	[[ "$DEMAND_REPOS" =~ ^[A-Za-z0-9._/,\ -]*$ ]] || die "${1:-}DEMAND_REPOS must be a comma-separated list of repo names (got '$DEMAND_REPOS')"
+	return 0
+}
+
+# ------------------------------------------------------------------ apps ----
+#
+# One host can serve several GitHub Apps (or PATs), each registering runners
+# in its own org or repo. config.env's credentials are the app `main`; each
+# APPS_DIR/<name>.env adds one and may set only APP_KEYS. Everything else --
+# sizing, labels, the image, the isolation rules -- is the host's and shared.
+# A registered runner serves exactly one org, so with two or more apps every
+# slot runs on demand: it boots once a queued job in any app's org wants it,
+# and mints that app's JIT config.
+
+APP_KEYS=(AUTH_MODE GITHUB_APP_ID GITHUB_APP_KEY GITHUB_PAT SCOPE GITHUB_ORG GITHUB_REPO RUNNER_GROUP RUNNER_GROUP_ID DEMAND_REPOS)
+APPS=(main)
+_APP=main
+# "<app>.<key>" -> value, filled by load_apps.
+declare -A _APPV=()
+# Per-app copies of the token, runner group and repo caches, swapped by app_use.
+declare -A _APP_TOKEN=() _APP_TOKEN_EXP=() _APP_RG_ID=() _APP_REPOS=() _APP_REPOS_AT=()
+
+multi_app() { ((${#APPS[@]} > 1)); }
+
+app_known() {
+	local a
+	for a in "${APPS[@]}"; do
+		[[ "$a" == "$1" ]] && return 0
+	done
+	return 1
+}
+
+# Values app file $1 sets, as NUL-separated key/value pairs. Sourced by a
+# clean bash, so it sees nothing of this process and leaves nothing behind.
+# A key outside APP_KEYS fails: it would otherwise be ignored without a word.
+app_file_values() {
+	# shellcheck disable=SC2016 # expanded by the inner bash
+	env -i PATH="$PATH" bash -c '
+		set -e
+		__before="$(compgen -v | sort)"
+		source "$1" >/dev/null
+		shift
+		for __k in $(comm -13 <(printf "%s\n" "$__before") <(compgen -v | sort)); do
+			[[ "$__k" == __* || " $* " == *" $__k "* ]] && continue
+			echo "$__k is not an app key (allowed: $*)" >&2
+			exit 3
+		done
+		for __k in "$@"; do
+			[[ -z "${!__k+x}" ]] || printf "%s\0%s\0" "$__k" "${!__k}"
+		done' _ "$1" "${APP_KEYS[@]}"
+}
+
+# Fills APPS and _APPV from the loaded globals (app `main`) and APPS_DIR.
+load_apps() {
+	local f name k i mode kv=()
+	APPS=(main)
+	_APP=main
+	_APPV=()
+	for k in "${APP_KEYS[@]}"; do
+		[[ -z "${!k+x}" ]] || _APPV["main.$k"]="${!k}"
+	done
+	[[ -e "$APPS_DIR" ]] || return 0
+	[[ -r "$APPS_DIR" && -x "$APPS_DIR" ]] || die "$APPS_DIR is not readable by $(id -un); run this command with sudo"
+	for f in "$APPS_DIR"/*.env; do
+		[[ -e "$f" ]] || continue
+		name="${f##*/}"
+		name="${name%.env}"
+		[[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ && "$name" != main ]] ||
+			die "$f: an app file is named <name>.env, name in lower-case letters, digits, - and _, and not 'main'"
+		[[ -r "$f" ]] || die "$f is not readable by $(id -un); run this command with sudo"
+		mode="$(stat -c '%a' "$f")"
+		((8#$mode & 8#0022)) && die "$f is group/world writable (mode $mode); chmod 0640"
+		mapfile -d '' -t kv < <(app_file_values "$f")
+		wait $! || die "$f: could not be loaded (see above)"
+		for ((i = 0; i + 1 < ${#kv[@]}; i += 2)); do
+			_APPV["$name.${kv[i]}"]="${kv[i + 1]}"
+		done
+		APPS+=("$name")
+	done
+	return 0
+}
+
+# Points the credential and scope globals, and the token, runner group and
+# repo caches, at app $1. Every GitHub call reads those globals, so whatever
+# talks to GitHub for one app switches to it first, in the shell that keeps
+# the caches.
+app_use() {
+	local name="$1" k
+	[[ "$name" == "$_APP" ]] && return 0
+	[[ " ${APPS[*]} " == *" $name "* ]] || die "unknown app '$name' (this host serves: ${APPS[*]})"
+	_APP_TOKEN["$_APP"]="$_TOKEN"
+	_APP_TOKEN_EXP["$_APP"]="$_TOKEN_EXP"
+	_APP_RG_ID["$_APP"]="$_RG_ID"
+	_APP_REPOS["$_APP"]="$_DEMAND_REPOS"
+	_APP_REPOS_AT["$_APP"]="$_DEMAND_REPOS_AT"
+	for k in "${APP_KEYS[@]}"; do
+		if [[ -n "${_APPV[$name.$k]+x}" ]]; then
+			printf -v "$k" '%s' "${_APPV[$name.$k]}"
+		else
+			unset "$k"
+		fi
+	done
+	RUNNER_GROUP_ID="${RUNNER_GROUP_ID:-1}"
+	RUNNER_GROUP="${RUNNER_GROUP:-}"
+	DEMAND_REPOS="${DEMAND_REPOS:-}"
+	[[ "${SCOPE:-}" == repo ]] && RUNNER_GROUP_ID=1
+	_TOKEN="${_APP_TOKEN[$name]:-}"
+	_TOKEN_EXP="${_APP_TOKEN_EXP[$name]:-0}"
+	_RG_ID="${_APP_RG_ID[$name]:-}"
+	_DEMAND_REPOS="${_APP_REPOS[$name]:-}"
+	_DEMAND_REPOS_AT="${_APP_REPOS_AT[$name]:-0}"
+	_APP="$name"
+}
+
+# Whether any app signs a JWT, and so needs a synced clock.
+any_app_auth() {
+	local a
+	for a in "${APPS[@]}"; do
+		[[ "${_APPV[$a.AUTH_MODE]:-}" == app ]] && return 0
+	done
+	return 1
+}
+
+# Where app $1's runners register, for messages.
+app_target() {
+	if [[ "${_APPV[$1.SCOPE]:-}" == repo ]]; then
+		printf '%s' "${_APPV[$1.GITHUB_REPO]:-?}"
+	else
+		printf '%s' "${_APPV[$1.GITHUB_ORG]:-?}"
+	fi
 }
 
 # Sizing values feed qemu and integer arithmetic; a typo here otherwise shows
@@ -434,7 +585,7 @@ validate_sizing() {
 	[[ "$VM_CPUS" =~ ^[1-9][0-9]*$ ]] || die "VM_CPUS must be a positive integer (got '$VM_CPUS')"
 	[[ "$VM_DISK" =~ ^[0-9]+[MGTmgt]$ ]] || die "VM_DISK must be like 80G (got '$VM_DISK')"
 	(($(mem_to_mb "$VM_MEM") > 0)) || die "VM_MEM must be above zero (got '$VM_MEM')"
-	[[ "$RUNNER_GROUP_ID" =~ ^[0-9]+$ ]] || die "RUNNER_GROUP_ID must be a number (got '$RUNNER_GROUP_ID')"
+	validate_app_values
 	local k
 	for k in STOP_GRACE_SEC REAP_INTERVAL JIT_BACKOFF_MAX CLOCK_SYNC_WAIT BOOT_TIMEOUT MAX_LIFETIME MIN_FREE_GB \
 		HOST_RESERVE_GB AUTOTUNE_HEADROOM_GB CPU_OVERCOMMIT MAX_SLOTS API_RETRY API_MAXTIME; do
@@ -453,7 +604,6 @@ validate_sizing() {
 	[[ "$MEMGUARD_INTERVAL" =~ ^[1-9][0-9]*$ ]] || die "MEMGUARD_INTERVAL must be a positive number of seconds (got '$MEMGUARD_INTERVAL')"
 	[[ "$DEMAND_POLL_SEC" =~ ^[1-9][0-9]*$ ]] || die "DEMAND_POLL_SEC must be a positive number of seconds (got '$DEMAND_POLL_SEC')"
 	[[ "$DEMAND_IDLE_SEC" =~ ^[1-9][0-9]*$ ]] || die "DEMAND_IDLE_SEC must be a positive number of seconds (got '$DEMAND_IDLE_SEC')"
-	[[ "$DEMAND_REPOS" =~ ^[A-Za-z0-9._/,\ -]*$ ]] || die "DEMAND_REPOS must be a comma-separated list of repo names (got '$DEMAND_REPOS')"
 	[[ "$GUEST_PIN_HOSTS" =~ ^[A-Za-z0-9.,\ -]*$ ]] || die "GUEST_PIN_HOSTS must be a space or comma separated list of host names (got '$GUEST_PIN_HOSTS')"
 	local zre='^[a-z0-9 ()/*+,.-]+$'
 	[[ "$HOST_ZRAM_SIZE" =~ $zre ]] || die "HOST_ZRAM_SIZE must be a zram-generator size expression like 'min(ram / 4, 8192)' (got '$HOST_ZRAM_SIZE')"
@@ -506,8 +656,10 @@ slot_extra_labels() {
 	printf '%s' "${!k:-}"
 }
 # ON_DEMAND_<n>=1: the slot holds no VM and no runner until a queued job asks
-# for one of its RUNNER_LABELS_EXTRA_<n> labels.
+# for one of its RUNNER_LABELS_EXTRA_<n> labels. With several apps every slot
+# is on demand, and one without extra labels starts for any job it fits.
 slot_on_demand() {
+	multi_app && return 0
 	local k="ON_DEMAND_$1"
 	[[ "${!k:-0}" == 1 ]]
 }
@@ -884,6 +1036,7 @@ fleet_admit() {
 	while :; do
 		if [[ -e "$(drain_flag "$slot")" ]]; then
 			rm -f "$wf"
+			[[ "$_DEMAND_SLOT" == "$slot" ]] && demand_unclaim "$slot"
 			return 1
 		fi
 		exec 8>"$lock"
@@ -904,10 +1057,11 @@ fleet_admit() {
 		# by another runner, cancelled); it must not hold the queue for it.
 		if [[ "$_DEMAND_SLOT" == "$slot" ]] && (($(date +%s) - _DEMAND_AT >= DEMAND_POLL_SEC)); then
 			local drc=0
-			demand_check "$slot" || drc=$?
+			demand_take "$slot" "$_DEMAND_BOOTED_APP" || drc=$?
 			if ((drc == 1)); then
 				log "slot $slot: no queued job asks for this slot any more; back to idle"
 				rm -f "$wf"
+				demand_unclaim "$slot"
 				return 1
 			fi
 		fi
@@ -1294,14 +1448,26 @@ mint_jit() {
 DEMAND_REPOS_TTL=600
 DEMAND_RECHECK_SEC=300
 DEMAND_IGNORE_SEC=3600
+# GitHub requests one queue scan keeps in flight.
+DEMAND_FETCH_PAR=8
+_DEMAND_BUCKET=0
+# Where demand_app_jobs shares its scans; `demand` keeps a private one so it
+# always reports the queue as it is now.
+_DEMAND_QUEUE_DIR=""
 _DEMAND_REPOS=""
 _DEMAND_REPOS_AT=0
 _DEMAND_SLOT=""
-# "<job id> <owner/repo>" found by the last check, and when it ran.
+# "<job id> <owner/repo>" found by the last check, the app whose org it is
+# in, and when the check ran.
 _DEMAND_JOB=""
+_DEMAND_APP=main
 _DEMAND_AT=0
-# The job the running VM was booted for.
+# Which app the next check looks at first, so one busy org cannot keep the
+# slots from ever seeing another's jobs.
+_DEMAND_RR=0
+# The job the running VM was booted for, and its app.
 _DEMAND_BOOTED=""
+_DEMAND_BOOTED_APP=main
 # "<job id>:<until epoch>" for jobs a VM was booted for and never got (a
 # runner group that excludes the repo, a job taken elsewhere), so they do not
 # boot the VM over and over.
@@ -1350,7 +1516,7 @@ api_get_cached() {
 		if [[ -n "$etag" || -n "$stamp" ]]; then
 			{
 				install -d -m 0700 "${f%/*}" &&
-					printf '%s\n%s\n%s' "$etag" "$stamp" "$resp" >"$f.$$" && mv -f "$f.$$" "$f"
+					printf '%s\n%s\n%s' "$etag" "$stamp" "$resp" >"$f.$BASHPID" && mv -f "$f.$BASHPID" "$f"
 			} || log "api: WARN could not cache GET $path under ${f%/*}"
 		fi
 		printf '%s' "$resp"
@@ -1421,30 +1587,108 @@ demand_repos_refresh() {
 # <labels>", labels lowercased and comma-joined. Returns 1 when any listing
 # failed, so a GitHub hiccup never reads as an empty queue.
 demand_queued_jobs() {
-	local repo st runs id updated jobs bucket n
-	bucket=$(($(date +%s) / DEMAND_RECHECK_SEC))
-	while read -r repo; do
-		[[ -n "$repo" ]] || continue
-		for st in queued in_progress; do
-			runs="$(api_get_cached "/repos/$repo/actions/runs?status=$st&per_page=100")" || return 1
-			n="$(jq '.workflow_runs | length' <<<"$runs")" || return 1
-			((n < 100)) || log "demand: WARN $repo has 100+ $st runs; only the newest 100 are checked"
-			while read -r id updated; do
-				[[ -n "$id" ]] || continue
-				jobs="$(api_get_cached "/repos/$repo/actions/runs/$id/jobs?filter=latest&per_page=100" "$updated/$bucket")" ||
-					return 1
-				n="$(jq '.jobs | length' <<<"$jobs")" || return 1
-				((n < 100)) || log "demand: WARN run $id in $repo has 100+ jobs; only the first 100 are checked"
-				jq -r --arg r "$repo" '.jobs[] | select(.status == "queued")
-					| "\(.id) \($r) \(.labels | map(ascii_downcase) | join(","))"' <<<"$jobs" || return 1
-			done < <(jq -r '.workflow_runs[] | "\(.id) \(.updated_at)"' <<<"$runs")
+	local runs
+	_DEMAND_BUCKET=$(($(date +%s) / DEMAND_RECHECK_SEC))
+	runs="$(printf '%s\n' "$_DEMAND_REPOS" | demand_par demand_repo_runs)" || return 1
+	printf '%s\n' "$runs" | demand_par demand_run_jobs
+}
+
+# "<owner/repo> <run id> <updated_at>" for each queued or in-progress run of
+# repo $1.
+demand_repo_runs() {
+	local st runs n
+	for st in queued in_progress; do
+		runs="$(api_get_cached "/repos/$1/actions/runs?status=$st&per_page=100")" || return 1
+		n="$(jq '.workflow_runs | length' <<<"$runs")" || return 1
+		((n < 100)) || log "demand: WARN $1 has 100+ $st runs; only the newest 100 are checked"
+		jq -r --arg r "$1" '.workflow_runs[] | "\($r) \(.id) \(.updated_at)"' <<<"$runs" || return 1
+	done
+}
+
+# The queued jobs of run $1 ("<owner/repo> <run id> <updated_at>"), as
+# demand_queued_jobs prints them.
+demand_run_jobs() {
+	local repo id updated jobs n
+	read -r repo id updated <<<"$1"
+	jobs="$(api_get_cached "/repos/$repo/actions/runs/$id/jobs?filter=latest&per_page=100" "$updated/$_DEMAND_BUCKET")" ||
+		return 1
+	n="$(jq '.jobs | length' <<<"$jobs")" || return 1
+	((n < 100)) || log "demand: WARN run $id in $repo has 100+ jobs; only the first 100 are checked"
+	jq -r --arg r "$repo" '.jobs[] | select(.status == "queued")
+		| "\(.id) \($r) \(.labels | map(ascii_downcase) | join(","))"' <<<"$jobs"
+}
+
+# Runs "$1 <line>" for each non-empty line of stdin, DEMAND_FETCH_PAR at a
+# time, and prints their output in input order. Fails when any of them did.
+# Must run in a subshell (a command substitution): wait -n reaps any child of
+# the shell, and the supervisor's own children include its VM.
+demand_par() {
+	local fn="$1" d line i=0 j n=0 rc=0
+	d="$(mktemp -d)" || return 1
+	while IFS= read -r line; do
+		[[ -n "$line" ]] || continue
+		if ((n >= DEMAND_FETCH_PAR)); then
+			wait -n || rc=1
+			n=$((n - 1))
+		fi
+		"$fn" "$line" >"$d/$i" &
+		i=$((i + 1))
+		n=$((n + 1))
+	done
+	while ((n > 0)); do
+		wait -n || rc=1
+		n=$((n - 1))
+	done
+	if ((rc == 0)); then
+		for ((j = 0; j < i; j++)); do
+			cat "$d/$j" || rc=1
 		done
-	done <<<"$_DEMAND_REPOS"
+	fi
+	rm -rf "$d"
+	return "$rc"
+}
+
+# The current app's queued jobs, as demand_queued_jobs prints them, shared by
+# the host's slots: the first to find the snapshot older than DEMAND_POLL_SEC
+# rescans under the app's lock while the others wait, then they all read that
+# scan, so a poll costs one scan per app rather than one per slot.
+demand_app_jobs() {
+	local d f
+	d="${_DEMAND_QUEUE_DIR:-$(demand_cache_dir)/queue}"
+	f="$d/$_APP"
+	install -d -m 0700 "$d" || return 1
+	(
+		flock 7 || exit 1
+		local at start jobs
+		at="$(head -n 1 "$f" 2>/dev/null)" || at=0
+		if [[ "$at" =~ ^[0-9]+$ ]] && (($(date +%s) - at < DEMAND_POLL_SEC)); then
+			tail -n +2 "$f"
+			exit 0
+		fi
+		# The repo list outlives one scan (DEMAND_REPOS_TTL); keep it beside it.
+		if [[ -z "$_DEMAND_REPOS" && -r "$f.repos" ]]; then
+			_DEMAND_REPOS_AT="$(head -n 1 "$f.repos")"
+			[[ "$_DEMAND_REPOS_AT" =~ ^[0-9]+$ ]] || _DEMAND_REPOS_AT=0
+			_DEMAND_REPOS="$(tail -n +2 "$f.repos")"
+		fi
+		start=$(date +%s)
+		demand_repos_refresh || exit 1
+		if ! { printf '%s\n%s\n' "$_DEMAND_REPOS_AT" "$_DEMAND_REPOS" >"$f.repos.$BASHPID" && mv -f "$f.repos.$BASHPID" "$f.repos"; }; then
+			log "demand: WARN could not keep the repo list of app $_APP under $d"
+		fi
+		jobs="$(demand_queued_jobs)" || exit 1
+		(($(date +%s) - start < DEMAND_POLL_SEC)) ||
+			log "demand: WARN scanning the queue of $(app_target "$_APP") took $(($(date +%s) - start))s over $(grep -c . <<<"$_DEMAND_REPOS") repos; DEMAND_REPOS in its app file can narrow it to the repos with self-hosted jobs"
+		if ! { printf '%s\n%s\n' "$start" "$jobs" >"$f.$BASHPID" && mv -f "$f.$BASHPID" "$f"; }; then
+			log "demand: WARN could not share the queue of app $_APP under $d"
+		fi
+		printf '%s\n' "$jobs"
+	) 7>"$f.lock"
 }
 
 # Whether a job labelled $1 is one this slot is for: every label is among the
-# runner's ($2), and one is among the slot's extra labels ($3). All lowercase,
-# comma-separated.
+# runner's ($2), and, when the slot has extra labels ($3), one is among them.
+# All lowercase, comma-separated.
 demand_fits() {
 	local want="$1" have="$2" extra="$3" l hit=0 labels=()
 	IFS=, read -ra labels <<<"$want"
@@ -1452,36 +1696,127 @@ demand_fits() {
 		[[ ",$have," == *",$l,"* ]] || return 1
 		[[ ",$extra," == *",$l,"* ]] && hit=1
 	done
-	((hit))
+	[[ -z "$extra" ]] || ((hit))
 }
 
-# Looks for a queued job on-demand slot $1 is for, with RUNNER_LABELS already
-# at the slot's class. 0: found, in _DEMAND_JOB; 1: none; 2: GitHub could not
-# be asked. Must run in the supervisor shell: it keeps the state above.
+# Looks for a queued job on-demand slot $1 is for, in app $2's org or, with no
+# $2, in every app's (starting from a different one each call), with
+# RUNNER_LABELS already at the slot's class. 0: found, in _DEMAND_JOB and
+# _DEMAND_APP; 1: none; 2: GitHub could not be asked for any app that had
+# none. Must run in the supervisor shell: it keeps the state above.
 demand_check() {
-	local slot="$1" jobs have extra id repo labels now tok
+	local slot="$1" only="${2:-}" jobs have extra id repo labels now tok a i n err=0 order=()
 	now=$(date +%s)
 	_DEMAND_AT=$now
 	_DEMAND_JOB=""
-	# Minted here so the listings, each in a subshell, reuse one token
-	# instead of minting their own.
-	if [[ "$AUTH_MODE" == app ]] && ((now >= _TOKEN_EXP - 300)); then
-		tok="$(auth_token)" || return 2
-		_TOKEN="$tok"
-		_TOKEN_EXP=$((now + 3600))
+	if [[ -n "$only" ]]; then
+		order=("$only")
+	else
+		n=${#APPS[@]}
+		for ((i = 0; i < n; i++)); do
+			order+=("${APPS[(_DEMAND_RR + i) % n]}")
+		done
+		_DEMAND_RR=$(((_DEMAND_RR + 1) % n))
 	fi
-	demand_repos_refresh || return 2
-	jobs="$(demand_queued_jobs)" || return 2
 	have="$(runner_labels_json | jq -r 'map(ascii_downcase) | join(",")')"
 	extra="$(slot_extra_labels "$slot" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
-	while read -r id repo labels; do
-		[[ -n "$id" ]] || continue
-		demand_ignored "$id" && continue
-		demand_fits "$labels" "$have" "$extra" || continue
-		_DEMAND_JOB="$id $repo"
-		return 0
-	done <<<"$jobs"
+	for a in "${order[@]}"; do
+		app_use "$a"
+		# Minted here so the listings, each in a subshell, reuse one token
+		# instead of minting their own.
+		if [[ "$AUTH_MODE" == app ]] && ((now >= _TOKEN_EXP - 300)); then
+			if ! tok="$(auth_token)"; then
+				err=1
+				continue
+			fi
+			_TOKEN="$tok"
+			_TOKEN_EXP=$((now + 3600))
+		fi
+		if ! jobs="$(demand_app_jobs)"; then
+			multi_app && log "demand: WARN could not read the Actions queue of app $a ($(app_target "$a"))"
+			err=1
+			continue
+		fi
+		while read -r id repo labels; do
+			[[ -n "$id" ]] || continue
+			demand_ignored "$id" && continue
+			demand_claimable "$id" "$slot" || continue
+			demand_fits "$labels" "$have" "$extra" || continue
+			_DEMAND_JOB="$id $repo"
+			_DEMAND_APP="$a"
+			return 0
+		done <<<"$jobs"
+	done
+	((err)) && return 2
 	return 1
+}
+
+# Host-wide claims on queued jobs, so the slots of one host boot one VM per
+# job rather than one each: a slot that found a job claims it before it
+# starts, and the others skip it. A claim lapses after BOOT_TIMEOUT +
+# DEMAND_IDLE_SEC, when a job still queued may start another slot.
+demand_claim_dir() { printf '%s/.demand-claims' "$RUN_DIR"; }
+
+# Whether job $1 is unclaimed, or claimed by slot $2 itself.
+demand_claimable() {
+	local f at owner
+	f="$(demand_claim_dir)/$1"
+	# A claim pruned between these reads is no claim.
+	at="$(stat -c %Y "$f" 2>/dev/null)" || return 0
+	(($(date +%s) - at >= BOOT_TIMEOUT + DEMAND_IDLE_SEC)) && return 0
+	owner="$(cat "$f" 2>/dev/null)" || return 0
+	[[ "$owner" == "$2" ]]
+}
+
+# Claims job $1 for slot $2. 1: another slot holds it; 2: the claim could
+# not be written.
+demand_claim() {
+	local d rc=0
+	d="$(demand_claim_dir)"
+	install -d -m 0750 "$d" || return 2
+	(
+		flock 7 || exit 2
+		demand_claimable "$1" "$2" || exit 1
+		printf '%s\n' "$2" >"$d/$1" || exit 2
+	) 7>"$d/.lock" || rc=$?
+	if ! find "$d" -type f -name '[0-9]*' -mmin +$(((BOOT_TIMEOUT + DEMAND_IDLE_SEC) / 60 + 60)) -delete; then
+		log "demand: WARN could not prune old claims from $d"
+	fi
+	return "$rc"
+}
+
+# Drops slot $1's claim on _DEMAND_BOOTED, when it still holds it.
+demand_unclaim() {
+	local d
+	[[ -n "$_DEMAND_BOOTED" ]] || return 0
+	d="$(demand_claim_dir)"
+	[[ -d "$d" ]] || return 0
+	(
+		flock 7 || exit 1
+		[[ "$(cat "$d/$_DEMAND_BOOTED" 2>/dev/null)" == "$1" ]] || exit 0
+		rm -f "$d/$_DEMAND_BOOTED"
+	) 7>"$d/.lock" || log "slot $1: WARN could not release the claim on job $_DEMAND_BOOTED"
+	_DEMAND_BOOTED=""
+}
+
+# demand_check for slot $1 (in app $2's org only, when given), then the claim
+# on what it found. 0: claimed, in _DEMAND_BOOTED and _DEMAND_BOOTED_APP;
+# 1: nothing for this slot; 2: GitHub or the claim directory failed.
+demand_take() {
+	local rc=0
+	demand_check "$1" "${2:-}" || rc=$?
+	((rc == 0)) || return "$rc"
+	demand_claim "${_DEMAND_JOB%% *}" "$1" || rc=$?
+	case "$rc" in
+	0)
+		[[ "$_DEMAND_BOOTED" != "${_DEMAND_JOB%% *}" ]] && demand_unclaim "$1"
+		_DEMAND_BOOTED="${_DEMAND_JOB%% *}"
+		_DEMAND_BOOTED_APP="$_DEMAND_APP"
+		;;
+	1) log "slot $1: job ${_DEMAND_JOB%% *} was claimed by another slot first" ;;
+	*) log "slot $1: WARN could not write a claim under $(demand_claim_dir)" ;;
+	esac
+	return "$rc"
 }
 
 demand_ignored() {
@@ -1511,17 +1846,16 @@ demand_ignore() {
 # and returns 1.
 demand_gate() {
 	local slot="$1" rc=0 state msg
-	demand_check "$slot" || rc=$?
+	demand_take "$slot" || rc=$?
 	case "$rc" in
 	0)
 		log "slot $slot: queued job ${_DEMAND_JOB% *} in ${_DEMAND_JOB#* } asks for this slot; starting"
-		_DEMAND_BOOTED="${_DEMAND_JOB%% *}"
 		_DEMAND_SAID=""
 		return 0
 		;;
 	1)
 		state=idle
-		msg="slot $slot: on demand; idle until a queued job asks for $(slot_extra_labels "$slot")"
+		msg="slot $slot: on demand; idle until a queued job asks for $(slot_demand_wants "$slot")"
 		;;
 	*)
 		state=error
@@ -1534,14 +1868,28 @@ demand_gate() {
 	return 1
 }
 
+# What a queued job must ask for to start on-demand slot $1, for messages.
+slot_demand_wants() {
+	local extra
+	extra="$(slot_extra_labels "$1")"
+	if [[ -n "$extra" ]]; then
+		printf '%s' "$extra"
+	else
+		printf 'only labels it carries'
+	fi
+}
+
 # Which queued job each on-demand slot would start for now.
 cmd_demand() {
 	local n rc found=0
 	# Run by hand as root, a shared cache would come out root-owned and
 	# unwritable for the supervisors.
+	_DEMAND_QUEUE_DIR="$(mktemp -d)" || die "could not create a temp directory"
 	if ((EUID == 0)) && [[ -z "$DEMAND_CACHE" ]]; then
-		DEMAND_CACHE="$(mktemp -d)"
-		trap 'rm -rf "$DEMAND_CACHE"' EXIT
+		DEMAND_CACHE="$(mktemp -d)" || die "could not create a temp directory"
+		trap 'rm -rf "$DEMAND_CACHE" "$_DEMAND_QUEUE_DIR"' EXIT
+	else
+		trap 'rm -rf "$_DEMAND_QUEUE_DIR"' EXIT
 	fi
 	while read -r n; do
 		[[ -n "$n" ]] || continue
@@ -1551,16 +1899,27 @@ cmd_demand() {
 		(
 			apply_slot_class "$n"
 			DEMAND_TOKEN=1
-			demand_check "$n" &&
-				printf 'slot %s: wanted by job %s in %s\n' "$n" "${_DEMAND_JOB% *}" "${_DEMAND_JOB#* }"
+			demand_check "$n" || exit
+			printf 'slot %s: wanted by job %s in %s' "$n" "${_DEMAND_JOB% *}" "${_DEMAND_JOB#* }"
+			multi_app && printf ' (app %s)' "$_DEMAND_APP"
+			echo
 		) || rc=$?
 		case "$rc" in
 		0) ;;
-		1) printf 'slot %s: idle; no queued job asks for %s\n' "$n" "$(slot_extra_labels "$n")" ;;
+		1) printf 'slot %s: idle; no queued job asks for %s\n' "$n" "$(slot_demand_wants "$n")" ;;
 		*) die "slot $n: could not read the Actions queue (see the api: lines above)" ;;
 		esac
-	done < <(slot_class_slots)
+	done < <(demand_slots)
 	((found)) || echo "no on-demand slots (set ON_DEMAND_<n>=1 beside RUNNER_LABELS_EXTRA_<n>)"
+}
+
+# The slots `demand` and `doctor` look at: those with a per-slot key, and
+# with several apps, where every slot is on demand, the installed ones too.
+demand_slots() {
+	{
+		slot_class_slots
+		multi_app && slot_list all
+	} | sort -nu
 }
 
 # ------------------------------------------------------------------ deps ----
@@ -2871,12 +3230,32 @@ reap_slot() {
 		'select(.name | ltrimstr($p) | test("^[0-9a-f]{8}$")) | .id' <<<"$runners")
 }
 
+# reap_slot in every app's org: any of them may hold this slot's leftovers.
+reap_slot_apps() {
+	local a rc=0
+	for a in "${APPS[@]}"; do
+		app_use "$a"
+		reap_slot "$1" || rc=1
+	done
+	return "$rc"
+}
+
 reap_one() {
 	local target="$1" id runners
 	runners="$(list_runners)" || return 1
 	id=$(jq -r --arg n "$target" 'select(.name==$n) | .id' <<<"$runners" | head -n1)
 	[[ -n "$id" ]] || return 0
 	api DELETE "$(runners_path)/$id" >/dev/null
+}
+
+# The app a run directory's VM registered with; a directory without the
+# file predates apps and belongs to main.
+vm_app() {
+	if [[ -r "$1/app" ]]; then
+		cat "$1/app"
+	else
+		printf main
+	fi
 }
 
 # A reboot or a SIGKILL leaves this slot's overlay behind; nothing else ever
@@ -2956,7 +3335,7 @@ wait_pid() {
 # after a reboot the clock may still be at the RTC's idea of the time, so the
 # first mint is held until NTP has confirmed it (bounded by CLOCK_SYNC_WAIT).
 wait_for_clock() {
-	[[ "$AUTH_MODE" == app ]] || return 0
+	any_app_auth || return 0
 	command -v timedatectl >/dev/null 2>&1 || return 0
 	local w=0
 	while [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != yes ]]; do
@@ -3169,7 +3548,7 @@ cmd_run() {
 	code="$(sed -n 1p <<<"$pair")"
 	vars="$(sed -n 2p <<<"$pair")"
 
-	local name="" dir="" vmpid="" tailpid="" fails=0 stopping=0 ready=0 mint_fails=0
+	local name="" dir="" vmpid="" tailpid="" fails=0 stopping=0 ready=0 mint_fails=0 app=main
 	local last_reap=0 self_inode
 	local cpu
 	cpu="$(guest_cpu_model)"
@@ -3194,6 +3573,7 @@ cmd_run() {
 		fi
 		if [[ -n "$name" && "$REAP_ON_STOP" == 1 ]]; then
 			# Bounded: a stop must not hang on a GitHub outage.
+			app_use "$app"
 			API_MAXTIME=5 API_RETRY=0 reap_one "$name" ||
 				log "slot $slot: WARN could not deregister $name; the startup reap will retry"
 		fi
@@ -3212,6 +3592,7 @@ cmd_run() {
 		stopping=1
 		local busy=0
 		if [[ -n "$vmpid" ]] && kill -0 "$vmpid" 2>/dev/null; then
+			app_use "$app"
 			if vm_has_job "$dir"; then
 				busy=1
 			elif grep -qF "$READY_MARKER" "$dir/console.log" 2>/dev/null &&
@@ -3236,7 +3617,7 @@ cmd_run() {
 	reap_slot_dirs "$slot"
 	# A GitHub outage here must not stop the slot from serving jobs.
 	wait_for_clock
-	reap_slot "$slot" || log "slot $slot: WARN startup reap failed; continuing"
+	reap_slot_apps "$slot" || log "slot $slot: WARN startup reap failed; continuing"
 	last_reap=$(date +%s)
 
 	while ((stopping == 0)); do
@@ -3279,13 +3660,19 @@ cmd_run() {
 		# an idle runner could take a job the host has no memory left for.
 		fleet_admit "$slot" "$need" || continue
 
+		# An on-demand VM registers with the app whose job it was booted for.
+		app=main
+		((on_demand)) && app="$_DEMAND_BOOTED_APP"
+		app_use "$app"
 		name="${NAME_PREFIX}-${slot}-$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')"
 		dir="$RUN_DIR/$name"
 		install -d -m 0700 "$dir"
+		printf '%s\n' "$app" >"$dir/app"
 
 		# The group lookup runs here, in the supervisor shell, so its result
 		# survives across cycles; inside the mint's subshell it would not.
-		local jit
+		local jit note=""
+		multi_app && note=", app $app"
 		if ! runner_group_id || ! jit="$(mint_jit "$name")"; then
 			mint_fails=$((mint_fails + 1))
 			rm -f "$(claim_flag "$slot")"
@@ -3302,7 +3689,7 @@ cmd_run() {
 				die "slot $slot: $mint_fails consecutive jit mint failures; exiting so the unit restarts"
 			local backoff=$((30 * mint_fails))
 			((backoff > JIT_BACKOFF_MAX)) && backoff=$JIT_BACKOFF_MAX
-			log "slot $slot: jit mint failed (#$mint_fails), retry in ${backoff}s"
+			log "slot $slot: jit mint failed (#$mint_fails$note), retry in ${backoff}s"
 			nap "$backoff"
 			continue
 		fi
@@ -3366,6 +3753,7 @@ cmd_run() {
 			elif ((short_since == 0)); then
 				short_since=$now
 			elif ((now - short_since >= HOST_SHED_SEC)); then
+				app_use "$app"
 				if API_MAXTIME=10 API_RETRY=0 reap_one "$name"; then
 					log "slot $slot: shedding idle $name: $short"
 					reason="$shed_kind"
@@ -3381,10 +3769,12 @@ cmd_run() {
 				((idle_since)) || idle_since=$now
 				if ((now - idle_since >= DEMAND_IDLE_SEC)); then
 					demand_ignore "$_DEMAND_BOOTED"
+					# Only a job in this VM's own org can land on it.
 					drc=0
-					demand_check "$slot" || drc=$?
-					((drc == 0)) && _DEMAND_BOOTED="${_DEMAND_JOB%% *}"
+					demand_take "$slot" "$app" || drc=$?
+					app_use "$app"
 					if ((drc == 1)) && API_MAXTIME=10 API_RETRY=0 reap_one "$name"; then
+						demand_unclaim "$slot"
 						log "slot $slot: $name got no job in ${DEMAND_IDLE_SEC}s and none is queued for it; stopping"
 						reason="no-demand"
 						break
@@ -3439,9 +3829,10 @@ cmd_run() {
 		# that was killed or never came up is deregistered right away.
 		now=$(date +%s)
 		if [[ -n "$reason" ]] || ((ready == 0)); then
+			app_use "$app"
 			reap_one "$name" || log "slot $slot: WARN could not deregister $name; it will be reaped later"
 		elif ((now - last_reap >= REAP_INTERVAL)); then
-			reap_slot "$slot" || log "slot $slot: WARN periodic reap failed; continuing"
+			reap_slot_apps "$slot" || log "slot $slot: WARN periodic reap failed; continuing"
 			last_reap=$now
 		fi
 		log "slot $slot: vm exited rc=$rc after ${elapsed}s${reason:+ ($reason)}"
@@ -3510,7 +3901,7 @@ vm_pid() { # vm_pid SLOT NAME -> pid of the QEMU running NAME in the slot's unit
 }
 
 stop_idle_vm() {
-	local slot="$1" d name pid
+	local slot="$1" d name pid app
 	slot_is_live "$slot" || return 0
 	for d in "$RUN_DIR/${NAME_PREFIX}-${slot}-"*/; do
 		[[ -d "$d" ]] || continue
@@ -3519,7 +3910,12 @@ stop_idle_vm() {
 		pid="$(vm_pid "$slot" "$name")"
 		[[ -n "$pid" ]] || continue
 		vm_has_job "$d" && return 1
-		if ! API_MAXTIME=10 API_RETRY=0 reap_one "$name"; then
+		app="$(vm_app "$d")"
+		# The app may have left apps.d since the VM registered; dying here
+		# would leave every slot cmd_restart drained.
+		if ! app_known "$app"; then
+			log "slot $slot: WARN $name registered with app '$app', which is no longer configured; stopping it without deregistering"
+		elif app_use "$app" && ! API_MAXTIME=10 API_RETRY=0 reap_one "$name"; then
 			log "slot $slot: WARN could not deregister $name; checking its console once more before stopping it"
 			sleep 10
 			vm_has_job "$d" && return 1
@@ -3581,8 +3977,18 @@ cmd_restart() {
 # slot names are considered, so a sibling host sharing a NAME_PREFIX stem
 # (gha-box and gha-box2) never reaps the other's runners.
 cmd_reap() {
+	local a failed=()
+	for a in "${APPS[@]}"; do
+		app_use "$a"
+		reap_app || failed+=("$(app_target "$a")")
+	done
+	app_use main
+	((${#failed[@]} == 0)) || die "could not list the runners of ${failed[*]}; nothing reaped there"
+}
+
+reap_app() {
 	local id name runners
-	runners="$(list_runners)" || die "could not list runners; nothing reaped"
+	runners="$(list_runners)" || return 1
 	while read -r id name; do
 		[[ -n "$id" ]] || continue
 		if [[ -d "$RUN_DIR/$name" ]]; then continue; fi
@@ -3805,11 +4211,27 @@ cmd_repair() {
 		fi
 	fi
 
-	if [[ "${AUTH_MODE:-}" == app && -e "${GITHUB_APP_KEY:-}" ]] &&
-		! user_can_read "$GHA_USER" "$GITHUB_APP_KEY"; then
-		log "repair: fixing ownership of $GITHUB_APP_KEY"
-		chown "root:$GHA_USER" "$GITHUB_APP_KEY"
-		chmod 0640 "$GITHUB_APP_KEY"
+	local a f
+	for a in "${APPS[@]}"; do
+		f="$APPS_DIR/$a.env"
+		if [[ "$a" != main ]] && { ((8#$(stat -c '%a' "$f") & 8#0007)) || [[ "$(stat -c '%U:%G' "$f")" != "root:$GHA_USER" ]]; }; then
+			log "repair: tightening $f to root:$GHA_USER 0640"
+			chown "root:$GHA_USER" "$f"
+			chmod 0640 "$f"
+			fixed=1
+		fi
+		f="${_APPV[$a.GITHUB_APP_KEY]:-}"
+		if [[ "${_APPV[$a.AUTH_MODE]:-}" == app && -e "$f" ]] && ! user_can_read "$GHA_USER" "$f"; then
+			log "repair: fixing ownership of $f"
+			chown "root:$GHA_USER" "$f"
+			chmod 0640 "$f"
+			fixed=1
+		fi
+	done
+	if [[ -d "$APPS_DIR" ]] && ! user_can_read "$GHA_USER" "$APPS_DIR"; then
+		log "repair: letting $GHA_USER read $APPS_DIR"
+		chown "root:$GHA_USER" "$APPS_DIR"
+		chmod 0750 "$APPS_DIR"
 		fixed=1
 	fi
 
@@ -3892,6 +4314,129 @@ install_atomic() {
 	mv -f "$tmp" "$dst"
 }
 
+# The GitHub-side checks for the app currently loaded; sets cmd_doctor's ok.
+doctor_app() {
+	printf 'auth: '
+	# Two things force the command substitution. auth_token dies on failure, and
+	# called bare in an `if` it is NOT in a subshell -- its exit would end the whole
+	# report, silently skipping every check below. And its message is the single
+	# most useful line here (which of 401/404/422, and what to do), so capture
+	# stderr and print it rather than discarding it with the token.
+	local autherr=""
+	if autherr="$(auth_token 2>&1 >/dev/null)"; then echo "OK ($AUTH_MODE)"; else
+		echo FAIL
+		[[ -n "$autherr" ]] && printf '  %s\n' "$autherr"
+		ok=1
+	fi
+	printf 'runner admin access: '
+	if api GET "$(runners_path)" >/dev/null 2>&1; then echo OK; else
+		if [[ "$AUTH_MODE" == app ]]; then
+			if [[ "$SCOPE" == org ]]; then
+				echo "FAIL: grant the app Organization permissions > Self-hosted runners > Read and write, then accept the request in the org's Installed GitHub Apps"
+			else
+				echo "FAIL: grant the app Repository permissions > Administration > Read and write, then accept the request under the repo's Installed GitHub Apps"
+			fi
+		elif [[ "$SCOPE" == org ]]; then
+			echo "FAIL: the PAT needs the admin:org scope (and SSO authorization if $GITHUB_ORG enforces it)"
+		else
+			echo "FAIL: the PAT needs the repo scope"
+		fi
+		ok=1
+	fi
+
+	local dslot="" n
+	while read -r n; do
+		[[ -n "$n" ]] && slot_on_demand "$n" && {
+			dslot="$n"
+			break
+		}
+	done < <(demand_slots)
+	if [[ -n "$dslot" ]]; then
+		printf 'queued-job access (on-demand slot %s): ' "$dslot"
+		local derr="" drc=0
+		# Private cache: doctor runs as root and a shared one would come out
+		# unwritable for the supervisors.
+		# Exit 10 marks a readable queue (a job or none); a die inside exits 1.
+		derr="$( (
+			DEMAND_CACHE="$(mktemp -d)" || exit 2
+			trap 'rm -rf "$DEMAND_CACHE"' EXIT
+			apply_slot_class "$dslot"
+			DEMAND_TOKEN=1 _TOKEN="" _TOKEN_EXP=0
+			demand_check "$dslot" "$_APP" || (($? == 1)) || exit 2
+			exit 10
+		) 2>&1 >/dev/null)" || drc=$?
+		if ((drc == 10)); then echo OK; else
+			if [[ "$AUTH_MODE" == app ]]; then
+				echo "FAIL: grant the app Repository permissions > Actions > Read-only, then accept the re-issued installation request"
+			else
+				echo "FAIL: the PAT needs Actions read (classic: repo scope)"
+			fi
+			[[ -n "$derr" ]] && printf '  %s\n' "$derr"
+			ok=1
+		fi
+	fi
+
+	if [[ -n "$RUNNER_GROUP" && "$SCOPE" == org ]]; then
+		printf 'runner group: '
+		local rg_rc=0
+		runner_group_id 2>/dev/null || rg_rc=$?
+		case "$rg_rc" in
+		0) echo "OK ($RUNNER_GROUP = id $_RG_ID)" ;;
+		2)
+			echo "FAIL: no runner group named '$RUNNER_GROUP' in $GITHUB_ORG"
+			ok=1
+			;;
+		*)
+			echo "FAIL: could not list the runner groups of $GITHUB_ORG (API error; check the credential and GITHUB_API_URL)"
+			ok=1
+			;;
+		esac
+	fi
+
+	printf 'public repo exposure: '
+	# An API failure is reported as such: an unreadable answer is not "private".
+	local resp
+	if [[ "$SCOPE" == repo ]]; then
+		if ! resp="$(api GET "/repos/$GITHUB_REPO" 2>/dev/null)"; then
+			echo "UNKNOWN: could not read /repos/$GITHUB_REPO"
+			ok=1
+		elif [[ "$(jq -r .private <<<"$resp")" == false ]]; then
+			echo "DANGER: $GITHUB_REPO is public; fork PRs execute arbitrary code here"
+			fork_approval_advice
+			ok=1
+		else echo OK; fi
+	else
+		# The runner group gates public-repo access on its own, so ask the group
+		# first; whether the org merely owns public repos is the weaker signal and
+		# only answers when the group cannot be read.
+		local gid="" allows=""
+		if runner_group_id 2>/dev/null; then gid="$_RG_ID"; fi
+		if [[ -n "$gid" ]] && resp="$(api GET "/orgs/$GITHUB_ORG/actions/runner-groups/$gid" 2>/dev/null)"; then
+			# Not `// empty`: jq's alternative operator treats false as absent,
+			# which would turn the safe answer into an unknown one.
+			allows="$(jq -r '.allows_public_repositories' <<<"$resp" 2>/dev/null)" || allows=""
+		fi
+		case "$allows" in
+		true)
+			echo "DANGER: runner group $gid allows public repositories; fork PRs execute arbitrary code here"
+			fork_approval_advice
+			ok=1
+			;;
+		false) echo "OK (runner group $gid rejects public repos)" ;;
+		*)
+			if ! resp="$(api GET "/orgs/$GITHUB_ORG/repos?type=public&per_page=1" 2>/dev/null)"; then
+				echo "UNKNOWN: could not read runner group ${gid:-?} or list $GITHUB_ORG's public repos"
+				ok=1
+			elif [[ "$(jq 'length' <<<"$resp")" -gt 0 ]]; then
+				echo "DANGER: org has public repos and runner group ${gid:-?} is unreadable; restrict the group to private repos"
+				fork_approval_advice
+				ok=1
+			else echo OK; fi
+			;;
+		esac
+	fi
+}
+
 cmd_doctor() {
 	local ok=0 apt_holder
 	printf 'kvm: '
@@ -3946,15 +4491,30 @@ cmd_doctor() {
 		ok=1
 	else echo "OK ($mode)"; fi
 
-	if [[ "$AUTH_MODE" == app ]]; then
-		printf 'app key: '
-		if user_can_read "$GHA_USER" "$GITHUB_APP_KEY"; then
+	local a k
+	for a in "${APPS[@]}"; do
+		if [[ "$a" != main ]]; then
+			k="$APPS_DIR/$a.env"
+			printf 'app %s config: ' "$a"
+			mode="$(stat -c '%a' "$k" 2>/dev/null || echo 000)"
+			if ((8#$mode & 8#0007)); then
+				echo "FAIL: $k is mode $mode; want 0640 root:$GHA_USER"
+				ok=1
+			elif ! user_can_read "$GHA_USER" "$k"; then
+				echo "FAIL: $GHA_USER cannot read $k"
+				ok=1
+			else echo "OK ($mode)"; fi
+		fi
+		[[ "${_APPV[$a.AUTH_MODE]:-}" == app ]] || continue
+		k="${_APPV[$a.GITHUB_APP_KEY]:-}"
+		if multi_app; then printf 'app %s key: ' "$a"; else printf 'app key: '; fi
+		if user_can_read "$GHA_USER" "$k"; then
 			echo OK
 		else
-			echo "FAIL: $GHA_USER cannot read $GITHUB_APP_KEY (chown root:$GHA_USER, chmod 0640)"
+			echo "FAIL: $GHA_USER cannot read $k (chown root:$GHA_USER, chmod 0640)"
 			ok=1
 		fi
-	fi
+	done
 
 	printf 'kvm module: '
 	if [[ "$RUNNER_ARCH" == arm64 ]]; then
@@ -4050,120 +4610,13 @@ cmd_doctor() {
 		ok=1
 	fi
 
-	printf 'auth: '
-	# Two things force the command substitution. auth_token dies on failure, and
-	# called bare in an `if` it is NOT in a subshell -- its exit would end the whole
-	# report, silently skipping every check below. And its message is the single
-	# most useful line here (which of 401/404/422, and what to do), so capture
-	# stderr and print it rather than discarding it with the token.
-	local autherr=""
-	if autherr="$(auth_token 2>&1 >/dev/null)"; then echo "OK ($AUTH_MODE)"; else
-		echo FAIL
-		[[ -n "$autherr" ]] && printf '  %s\n' "$autherr"
-		ok=1
-	fi
-	printf 'runner admin access: '
-	if api GET "$(runners_path)" >/dev/null 2>&1; then echo OK; else
-		if [[ "$AUTH_MODE" == app ]]; then
-			if [[ "$SCOPE" == org ]]; then
-				echo "FAIL: grant the app Organization permissions > Self-hosted runners > Read and write, then accept the request in the org's Installed GitHub Apps"
-			else
-				echo "FAIL: grant the app Repository permissions > Administration > Read and write, then accept the request under the repo's Installed GitHub Apps"
-			fi
-		elif [[ "$SCOPE" == org ]]; then
-			echo "FAIL: the PAT needs the admin:org scope (and SSO authorization if $GITHUB_ORG enforces it)"
-		else
-			echo "FAIL: the PAT needs the repo scope"
-		fi
-		ok=1
-	fi
-
-	local dslot
-	dslot="$(while read -r n; do [[ -n "$n" ]] && slot_on_demand "$n" && echo "$n"; done < <(slot_class_slots) | head -1)"
-	if [[ -n "$dslot" ]]; then
-		printf 'queued-job access (on-demand slot %s): ' "$dslot"
-		local derr="" drc=0
-		# Private cache: doctor runs as root and a shared one would come out
-		# unwritable for the supervisors.
-		# Exit 10 marks a readable queue (a job or none); a die inside exits 1.
-		derr="$( (
-			DEMAND_CACHE="$(mktemp -d)" || exit 2
-			trap 'rm -rf "$DEMAND_CACHE"' EXIT
-			apply_slot_class "$dslot"
-			DEMAND_TOKEN=1 _TOKEN="" _TOKEN_EXP=0
-			demand_check "$dslot" || (($? == 1)) || exit 2
-			exit 10
-		) 2>&1 >/dev/null)" || drc=$?
-		if ((drc == 10)); then echo OK; else
-			if [[ "$AUTH_MODE" == app ]]; then
-				echo "FAIL: grant the app Repository permissions > Actions > Read-only, then accept the re-issued installation request"
-			else
-				echo "FAIL: the PAT needs Actions read (classic: repo scope)"
-			fi
-			[[ -n "$derr" ]] && printf '  %s\n' "$derr"
-			ok=1
-		fi
-	fi
-
-	if [[ -n "$RUNNER_GROUP" && "$SCOPE" == org ]]; then
-		printf 'runner group: '
-		local rg_rc=0
-		runner_group_id 2>/dev/null || rg_rc=$?
-		case "$rg_rc" in
-		0) echo "OK ($RUNNER_GROUP = id $_RG_ID)" ;;
-		2)
-			echo "FAIL: no runner group named '$RUNNER_GROUP' in $GITHUB_ORG"
-			ok=1
-			;;
-		*)
-			echo "FAIL: could not list the runner groups of $GITHUB_ORG (API error; check the credential and GITHUB_API_URL)"
-			ok=1
-			;;
-		esac
-	fi
-
-	printf 'public repo exposure: '
-	# An API failure is reported as such: an unreadable answer is not "private".
-	local resp
-	if [[ "$SCOPE" == repo ]]; then
-		if ! resp="$(api GET "/repos/$GITHUB_REPO" 2>/dev/null)"; then
-			echo "UNKNOWN: could not read /repos/$GITHUB_REPO"
-			ok=1
-		elif [[ "$(jq -r .private <<<"$resp")" == false ]]; then
-			echo "DANGER: $GITHUB_REPO is public; fork PRs execute arbitrary code here"
-			fork_approval_advice
-			ok=1
-		else echo OK; fi
-	else
-		# The runner group gates public-repo access on its own, so ask the group
-		# first; whether the org merely owns public repos is the weaker signal and
-		# only answers when the group cannot be read.
-		local gid="" allows=""
-		if runner_group_id 2>/dev/null; then gid="$_RG_ID"; fi
-		if [[ -n "$gid" ]] && resp="$(api GET "/orgs/$GITHUB_ORG/actions/runner-groups/$gid" 2>/dev/null)"; then
-			# Not `// empty`: jq's alternative operator treats false as absent,
-			# which would turn the safe answer into an unknown one.
-			allows="$(jq -r '.allows_public_repositories' <<<"$resp" 2>/dev/null)" || allows=""
-		fi
-		case "$allows" in
-		true)
-			echo "DANGER: runner group $gid allows public repositories; fork PRs execute arbitrary code here"
-			fork_approval_advice
-			ok=1
-			;;
-		false) echo "OK (runner group $gid rejects public repos)" ;;
-		*)
-			if ! resp="$(api GET "/orgs/$GITHUB_ORG/repos?type=public&per_page=1" 2>/dev/null)"; then
-				echo "UNKNOWN: could not read runner group ${gid:-?} or list $GITHUB_ORG's public repos"
-				ok=1
-			elif [[ "$(jq 'length' <<<"$resp")" -gt 0 ]]; then
-				echo "DANGER: org has public repos and runner group ${gid:-?} is unreadable; restrict the group to private repos"
-				fork_approval_advice
-				ok=1
-			else echo OK; fi
-			;;
-		esac
-	fi
+	local a
+	for a in "${APPS[@]}"; do
+		app_use "$a"
+		multi_app && printf -- '-- app %s (%s) --\n' "$a" "$(app_target "$a")"
+		doctor_app
+	done
+	app_use main
 
 	printf 'host isolation: '
 	local nft_rules=""
@@ -4341,19 +4794,28 @@ cmd_status() {
 	done
 	((found)) || echo "none"
 	echo
-	echo "== registered runners ($NAME_PREFIX) =="
-	local runners rows
-	if ! runners="$(list_runners)"; then
-		echo "UNAVAILABLE: could not list runners (see the api: line above)"
-		return 1
-	fi
-	rows="$(jq -r --arg p "$NAME_PREFIX" \
-		'select(.name|startswith($p)) | "\(.name)\t\(.status)\tbusy=\(.busy)"' <<<"$runners")"
-	if command -v column >/dev/null 2>&1; then
-		column -t <<<"$rows"
-	else
-		cat <<<"$rows"
-	fi
+	local a runners rows rc=0
+	for a in "${APPS[@]}"; do
+		app_use "$a"
+		if multi_app; then
+			echo "== registered runners ($NAME_PREFIX), app $a ($(app_target "$a")) =="
+		else
+			echo "== registered runners ($NAME_PREFIX) =="
+		fi
+		if ! runners="$(list_runners)"; then
+			echo "UNAVAILABLE: could not list runners (see the api: line above)"
+			rc=1
+			continue
+		fi
+		rows="$(jq -r --arg p "$NAME_PREFIX" \
+			'select(.name|startswith($p)) | "\(.name)\t\(.status)\tbusy=\(.busy)"' <<<"$runners")"
+		if command -v column >/dev/null 2>&1; then
+			column -t <<<"$rows"
+		else
+			cat <<<"$rows"
+		fi
+	done
+	return "$rc"
 }
 
 # --------------------------------------------------------------- install ----
@@ -4856,6 +5318,197 @@ cmd_config() {
 	return 0
 }
 
+# The apps this host serves and where each registers its runners. Secrets
+# are never printed: the key by path, a PAT as <set>.
+cmd_apps() {
+	local a src cred
+	for a in "${APPS[@]}"; do
+		src="$CONFIG"
+		[[ "$a" == main ]] || src="$APPS_DIR/$a.env"
+		if [[ "${_APPV[$a.AUTH_MODE]:-}" == app ]]; then
+			cred="app id ${_APPV[$a.GITHUB_APP_ID]:-?}, key ${_APPV[$a.GITHUB_APP_KEY]:-?}"
+		elif [[ -n "${_APPV[$a.GITHUB_PAT]:-}" ]]; then
+			cred="pat <set>"
+		else
+			cred="pat <missing>"
+		fi
+		printf '%s\t%s %s\tgroup %s\t%s\t%s\n' "$a" "${_APPV[$a.SCOPE]:-?}" "$(app_target "$a")" \
+			"${_APPV[$a.RUNNER_GROUP]:-id ${_APPV[$a.RUNNER_GROUP_ID]:-1}}" "$cred" "$src"
+	done
+	if multi_app; then
+		echo "${#APPS[@]} apps: every slot is on demand and serves whichever org queues a job it fits"
+	fi
+}
+
+# ---------------------------------------------------------------- bundle ----
+
+# config.env keys a bundle leaves out: they describe this machine, and setup
+# sizes the receiving host from its own hardware instead.
+BUNDLE_HOST_KEYS_RE='^(MAX_SLOTS|NESTED_VIRT|VM_CPUS|VM_DISK|VM_MEM|HOST_ARCH|HOST_PROFILE|NAME_PREFIX|HOST_RESERVE_GB|FLEET_MEM|NET_HOST_ADDRS|NET_DNS_ADDRS|(VM_MEM|VM_CPUS|RUNNER_LABELS_EXTRA|ON_DEMAND)_[0-9]+)$'
+
+# Writes a self-extracting script ($1, default ~/gha-vm-bundle.sh of the
+# invoking user) that makes another host a member of this pool: the checkout
+# this script runs from, config.env without the host keys, every app file,
+# every app key and image.d. Its head tells an operator (or an agent) what to
+# do with it; the payload after BUNDLE_PAYLOAD is secret.
+cmd_bundle() {
+	[[ $EUID -eq 0 ]] || die "bundle reads the credentials and must run as root"
+	local out="${1:-}" src="$HERE" stage sec home rev k a f sum removed=()
+	[[ -r "$src/setup.sh" && -r "$src/README.md" ]] ||
+		die "bundle packs the gha-runner checkout, and $src is not one (no setup.sh, README.md); run it from the checkout"
+	if [[ -z "$out" ]]; then
+		home="$HOME"
+		[[ -n "${SUDO_USER:-}" ]] && home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+		out="$home/gha-vm-bundle.sh"
+	fi
+	[[ ! -e "$out" ]] || die "$out already exists; remove it or name another file"
+	stage="$(mktemp -d)" || die "could not create a staging directory"
+	# Global: the trap runs after this function's locals are gone.
+	_BUNDLE_STAGE="$stage"
+	trap 'rm -rf "$_BUNDLE_STAGE"' EXIT
+	sec="$stage/secrets"
+	install -d -m 0700 "$stage/gha-runner" "$sec"
+	tar -C "$src" --exclude='*/.*' --exclude='__pycache__' -cf - . | tar -C "$stage/gha-runner" -xf - ||
+		die "could not copy $src"
+
+	install -m 0600 "$CONFIG" "$sec/config.env"
+	while read -r k; do
+		[[ "$k" =~ $BUNDLE_HOST_KEYS_RE ]] || continue
+		config_unset "$k" "$sec/config.env"
+		# config_unset only matches a plain KEY= line.
+		grep -qE "^[[:space:]]*(export[[:space:]]+)?$k=" "$sec/config.env" &&
+			die "$CONFIG sets $k indented or with export; write it as a plain $k= line and rerun"
+		removed+=("$k")
+	done < <(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' "$CONFIG" | sort -u)
+	if [[ "${_APPV[main.AUTH_MODE]:-}" == app ]]; then
+		[[ -n "${_APPV[main.GITHUB_APP_KEY]:-}" ]] || die "$CONFIG: AUTH_MODE=app needs GITHUB_APP_KEY"
+		install -m 0600 "${_APPV[main.GITHUB_APP_KEY]}" "$sec/app.pem"
+		config_set GITHUB_APP_KEY /etc/gha-vm/app.pem "$sec/config.env"
+	fi
+	for a in "${APPS[@]:1}"; do
+		install -d -m 0700 "$sec/apps.d"
+		f="$sec/apps.d/$a.env"
+		install -m 0600 "$APPS_DIR/$a.env" "$f"
+		if [[ "${_APPV[$a.AUTH_MODE]:-}" == app ]]; then
+			[[ -n "${_APPV[$a.GITHUB_APP_KEY]:-}" ]] || die "$APPS_DIR/$a.env: AUTH_MODE=app needs GITHUB_APP_KEY"
+			install -m 0600 "${_APPV[$a.GITHUB_APP_KEY]}" "$sec/apps.d/$a.pem"
+			config_set GITHUB_APP_KEY "/etc/gha-vm/apps.d/$a.pem" "$f"
+		fi
+	done
+	if [[ -d "$IMAGE_HOOK_DIR" && -n "$(ls -A "$IMAGE_HOOK_DIR")" ]]; then
+		cp -R "$IMAGE_HOOK_DIR" "$sec/image.d"
+	fi
+	printf '%s\n' "${removed[@]}" >"$sec/removed-keys.txt"
+
+	tar -C "$stage" --owner=0 --group=0 -czf "$stage/payload.tgz" gha-runner secrets || die "could not pack the bundle"
+	sum="$(sha256sum "$stage/payload.tgz" | cut -d' ' -f1)"
+	if rev="$(git -c safe.directory="$src" -C "$src" rev-parse --short HEAD 2>/dev/null)"; then
+		[[ -z "$(git -c safe.directory="$src" -C "$src" status --porcelain -- . 2>/dev/null)" ]] || rev+=" plus uncommitted changes"
+	else
+		rev="no git checkout"
+	fi
+	(
+		umask 077
+		{
+			bundle_head "$(hostname -s)" "$rev" "${removed[*]}" "${out##*/}"
+			printf 'BUNDLE_SHA256=%s\n' "$sum"
+			bundle_extractor
+			echo BUNDLE_PAYLOAD
+			base64 -w 76 "$stage/payload.tgz"
+		} >"$out"
+	) || die "could not write $out"
+	[[ -z "${SUDO_USER:-}" ]] || chown "$SUDO_USER:" "$out"
+	log "wrote $out: apps ${APPS[*]}, $(wc -c <"$out") bytes; it holds every credential of this pool, so move it like a key and delete it after use"
+}
+
+# The instructions at the top of a bundle: $1 source host, $2 revision, $3
+# the host keys left out, $4 the bundle's file name.
+bundle_head() {
+	cat <<EOF
+#!/usr/bin/env bash
+# gha-vm pool bundle from host $1 (gha-runner $2). Contains GitHub credentials.
+# Extract: bash $4   (to ~/gha-vm-transfer, or the directory given as \$1)
+# Agents: read only up to the line BUNDLE_PAYLOAD; everything after it is a secret archive.
+: <<'AGENT_INSTRUCTIONS'
+Make this machine a host of an existing gha-vm GitHub Actions runner pool
+(ephemeral KVM microVM runners, shared across hosts). The pool serves these
+GitHub Apps: ${APPS[*]}. With more than one, every slot is on demand: it boots
+a VM only when a queued job in one of the apps' orgs fits it, and registers
+that VM with that job's org. This file is a self-extracting bundle made on
+host "$1". Never print, cat or Read the payload, any .pem, config.env or
+apps.d/*.env values (GITHUB_PAT especially); refer to them by path.
+
+1. Preflight: Ubuntu 26.04, /dev/kvm present, CPU exposes VT-x/SVM
+   (grep -cE 'vmx|svm' /proc/cpuinfo > 0), and /var/lib/gha-vm on fast local
+   disk with room for the VM images. Stop and report if any fail.
+   Commands below need sudo; if it asks for a password, ask me to enter it.
+2. Extract: bash ~/$4
+   This creates ~/gha-vm-transfer/gha-runner (the code) and
+   ~/gha-vm-transfer/secrets (config.env, app.pem, apps.d/, optional image.d/,
+   removed-keys.txt). Read ~/gha-vm-transfer/gha-runner/README.md sections
+   "Install", "Host profiles", "Several GitHub Apps" and "Shared fleet memory".
+3. If this machine already runs gha-vm (/etc/gha-vm/config.env exists), it
+   moves onto this pool's config: keep a root-only copy of the old one first,
+     sudo cp -a /etc/gha-vm /root/gha-vm-etc-before-bundle
+   and tell me which org(s) it served; an org missing from the list above
+   stops being served here. Then, on any machine:
+     cd ~/gha-vm-transfer/gha-runner && sudo ./gha-vm.sh deps
+   (packages, KVM module, time sync, the gha user, /etc/gha-vm skeleton).
+4. Install the pool config over the skeleton:
+     S=~/gha-vm-transfer/secrets
+     sudo install -o root -g gha -m 0640 \$S/config.env /etc/gha-vm/config.env
+     [ -f \$S/app.pem ] && sudo install -o root -g gha -m 0640 \$S/app.pem /etc/gha-vm/app.pem
+     sudo rm -rf /etc/gha-vm/apps.d
+     [ -d \$S/apps.d ] && sudo install -d -o root -g gha -m 0750 /etc/gha-vm/apps.d &&
+       sudo install -o root -g gha -m 0640 \$S/apps.d/* /etc/gha-vm/apps.d/
+     [ -d \$S/image.d ] && sudo cp -R \$S/image.d/. /etc/gha-vm/image.d/ &&
+       sudo chown -R root:gha /etc/gha-vm/image.d
+   These keys were stripped from the source config so this host derives its own
+   (sizing, slot classes, arch, runner-name prefix): ${3:-none}.
+   Do not re-add them by hand; setup sizes this host from its hardware.
+5. sudo ./setup.sh -y
+   Non-interactive: keeps the copied credentials, sizes VMs and the slot count
+   for this machine, builds the golden image, installs the network isolation
+   rules and systemd units, and restarts running slots. It takes a while
+   (image build). If it fails, read the error, run sudo ./gha-vm.sh repair,
+   and re-run; anything repair leaves needs a decision from me -- report it.
+6. Verify: sudo gha-vm doctor must report zero failures, with the auth, runner
+   admin, queued-job, runner group and public repo lines passing for every app.
+   Then sudo gha-vm apps, sudo gha-vm status, gha-vm profile, gha-vm labels 1,
+   and sudo gha-vm demand (each slot idle or wanted by a job, no error). The
+   labels must include this host's short hostname.
+7. Clean up the secrets copy: shred -u ~/gha-vm-transfer/secrets/*.pem
+   ~/gha-vm-transfer/secrets/apps.d/* ~/gha-vm-transfer/secrets/config.env
+   ~/$4; rm -rf ~/gha-vm-transfer/secrets. Keep
+   ~/gha-vm-transfer/gha-runner only if you want it; the installed copy lives
+   in /usr/local/lib/gha-vm.
+8. Report: hostname, slot count and VM size chosen, labels, apps, doctor
+   summary, and anything skipped or unverified.
+
+Rules: no git writes. Never disable REQUIRE_ISOLATION, the public-repo check or
+any doctor check to get past an error. A credential or permission error (401,
+403, 422 on token mint) is mine to fix: stop and report it, do not work around it.
+AGENT_INSTRUCTIONS
+EOF
+}
+
+bundle_extractor() {
+	cat <<'EOF'
+set -Eeuo pipefail
+dest="${1:-$HOME/gha-vm-transfer}"
+[[ -e "$dest/secrets" ]] && { printf '%s/secrets already exists; remove it or pass another directory\n' "$dest" >&2; exit 1; }
+[[ -d "$dest" ]] || mkdir -p -m 700 "$dest"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+sed '1,/^BUNDLE_PAYLOAD$/d' "$0" | tr -d '\r' | base64 -d >"$tmp"
+printf '%s  %s\n' "$BUNDLE_SHA256" "$tmp" | sha256sum -c --quiet - ||
+	{ printf 'bundle payload is damaged (checksum mismatch); copy the file again\n' >&2; exit 1; }
+tar -xzf "$tmp" -C "$dest" --no-same-owner
+printf 'extracted to %s (gha-runner/, secrets/)\n' "$dest"
+exit 0
+EOF
+}
+
 # ------------------------------------------------------------------ main ----
 
 usage() { sed -n '3,/^# --- end usage ---$/{/^# --- end usage ---$/!p}' "$SELF" | sed 's/^# \{0,1\}//'; }
@@ -4953,6 +5606,14 @@ main() {
 	demand)
 		load_config
 		cmd_demand
+		;;
+	apps)
+		load_config
+		cmd_apps
+		;;
+	bundle)
+		load_config
+		cmd_bundle "$@"
 		;;
 	drain)
 		load_config
