@@ -32,6 +32,7 @@
 #   gha-vm.sh demand            queued jobs each on-demand slot would start for
 #   gha-vm.sh apps              the GitHub Apps (orgs) this host serves; extra ones live in apps.d/
 #   gha-vm.sh bundle [file]     self-extracting copy of this pool's code + config for another host
+#   gha-vm.sh join <bundle> [n] make this host a pool member from a bundle, with this checkout's code
 #   gha-vm.sh reap | clean [--force]     cleanup
 #
 # Isolation model: the boundary is the VM, not a namespace. Inside the guest the
@@ -1451,9 +1452,10 @@ DEMAND_IGNORE_SEC=3600
 # GitHub requests one queue scan keeps in flight.
 DEMAND_FETCH_PAR=8
 _DEMAND_BUCKET=0
-# Where demand_app_jobs shares its scans; `demand` keeps a private one so it
-# always reports the queue as it is now.
-_DEMAND_QUEUE_DIR=""
+# Where demand_app_jobs shares its scans and pacing; `demand` keeps a private
+# one so it always reports the queue as it is now, unless GHA_DEMAND_QUEUE
+# names one (the tests, to see pacing across runs).
+_DEMAND_QUEUE_DIR="${GHA_DEMAND_QUEUE:-}"
 _DEMAND_REPOS=""
 _DEMAND_REPOS_AT=0
 _DEMAND_SLOT=""
@@ -1509,6 +1511,7 @@ api_get_cached() {
 	fi
 	code="${resp##*$'\n'}"
 	resp="${resp%$'\n'*}"
+	demand_note_rate "$hdr"
 	case "$code" in
 	200)
 		etag="$(awk 'tolower($1) == "etag:" { sub(/^[^:]*: */, ""); print; exit }' "$hdr" | tr -d '\r')"
@@ -1648,22 +1651,70 @@ demand_par() {
 	return "$rc"
 }
 
+demand_queue_dir() { printf '%s' "${_DEMAND_QUEUE_DIR:-$(demand_cache_dir)/queue}"; }
+
+# Records the rate-limit headers in response headers file $1 for the current
+# app as "<remaining> <reset epoch> <limit>", for demand_app_jobs' pacing. A
+# Retry-After (GitHub's secondary limit) reads as nothing left until then.
+demand_note_rate() {
+	local rate d
+	rate="$(awk -v now="$(date +%s)" '
+		{ k = tolower($1); sub(/\r$/, "", $2) }
+		k == "x-ratelimit-remaining:" { r = $2 }
+		k == "x-ratelimit-reset:" { t = $2 }
+		k == "x-ratelimit-limit:" { l = $2 }
+		k == "retry-after:" { a = $2 }
+		END {
+			if (a ~ /^[0-9]+$/) print 0, now + a, (l ~ /^[0-9]+$/ ? l : 0)
+			else if (r ~ /^[0-9]+$/ && t ~ /^[0-9]+$/ && l ~ /^[0-9]+$/) print r, t, l
+		}' "$1")"
+	[[ -n "$rate" ]] || return 0
+	d="$(demand_queue_dir)"
+	if ! { install -d -m 0700 "$d" && printf '%s\n' "$rate" >"$d/$_APP.rate.$BASHPID" && mv -f "$d/$_APP.rate.$BASHPID" "$d/$_APP.rate"; }; then
+		log "demand: WARN could not record the rate limit of app $_APP under $d"
+	fi
+}
+
+# The requests of the current app's rate limit a queue scan leaves for minting
+# tokens and registering runners.
+demand_rate_reserve() {
+	local r=$(($1 / 10))
+	((r >= 100)) || r=100
+	echo "$r"
+}
+
 # The current app's queued jobs, as demand_queued_jobs prints them, shared by
-# the host's slots: the first to find the snapshot older than DEMAND_POLL_SEC
-# rescans under the app's lock while the others wait, then they all read that
-# scan, so a poll costs one scan per app rather than one per slot.
+# the host's slots: the first to find the snapshot due rescans under the app's
+# lock while the others wait, then they all read that scan, so a poll costs
+# one scan per app rather than one per slot. A scan is due DEMAND_POLL_SEC
+# after the last, or later when the app's rate limit cannot pay for one that
+# often: what the last scan cost is spread over what is left of the limit's
+# window, minus a reserve, so hosts sharing the installation pace each other.
+# 3: scans are paused until the limit resets.
 demand_app_jobs() {
 	local d f
-	d="${_DEMAND_QUEUE_DIR:-$(demand_cache_dir)/queue}"
+	d="$(demand_queue_dir)"
 	f="$d/$_APP"
 	install -d -m 0700 "$d" || return 1
 	(
 		flock 7 || exit 1
-		local at start jobs
-		at="$(head -n 1 "$f" 2>/dev/null)" || at=0
-		if [[ "$at" =~ ^[0-9]+$ ]] && (($(date +%s) - at < DEMAND_POLL_SEC)); then
+		local at="" next="" start now jobs rem0="" reset0="" rem="" reset="" lim="" cost gap budget reserve
+		read -r at next 2>/dev/null <"$f" || :
+		[[ "$at" =~ ^[0-9]+$ ]] || at=0
+		[[ "$next" =~ ^[0-9]+$ ]] || next=$((at + DEMAND_POLL_SEC))
+		now=$(date +%s)
+		if ((now < next)) && ((at > 0)); then
 			tail -n +2 "$f"
 			exit 0
+		fi
+		read -r rem0 reset0 lim 2>/dev/null <"$f.rate" || :
+		if [[ "$rem0" =~ ^[0-9]+$ && "$reset0" =~ ^[0-9]+$ ]] && ((now < reset0)) &&
+			((rem0 <= $(demand_rate_reserve "${lim:-0}"))); then
+			if [[ ! -e "$f.paused" ]]; then
+				log "demand: WARN the GitHub rate limit of app $_APP ($(app_target "$_APP")) is down to $rem0; pausing its queue scans until $(date -d "@$reset0" +%H:%M:%S)"
+				: >"$f.paused" || log "demand: WARN could not mark app $_APP paused under $d"
+			fi
+			exit 3
 		fi
 		# The repo list outlives one scan (DEMAND_REPOS_TTL); keep it beside it.
 		if [[ -z "$_DEMAND_REPOS" && -r "$f.repos" ]]; then
@@ -1671,15 +1722,38 @@ demand_app_jobs() {
 			[[ "$_DEMAND_REPOS_AT" =~ ^[0-9]+$ ]] || _DEMAND_REPOS_AT=0
 			_DEMAND_REPOS="$(tail -n +2 "$f.repos")"
 		fi
-		start=$(date +%s)
+		start=$now
 		demand_repos_refresh || exit 1
 		if ! { printf '%s\n%s\n' "$_DEMAND_REPOS_AT" "$_DEMAND_REPOS" >"$f.repos.$BASHPID" && mv -f "$f.repos.$BASHPID" "$f.repos"; }; then
 			log "demand: WARN could not keep the repo list of app $_APP under $d"
 		fi
 		jobs="$(demand_queued_jobs)" || exit 1
-		(($(date +%s) - start < DEMAND_POLL_SEC)) ||
-			log "demand: WARN scanning the queue of $(app_target "$_APP") took $(($(date +%s) - start))s over $(grep -c . <<<"$_DEMAND_REPOS") repos; DEMAND_REPOS in its app file can narrow it to the repos with self-hosted jobs"
-		if ! { printf '%s\n%s\n' "$start" "$jobs" >"$f.$BASHPID" && mv -f "$f.$BASHPID" "$f"; }; then
+		now=$(date +%s)
+		((now - start < DEMAND_POLL_SEC)) ||
+			log "demand: WARN scanning the queue of $(app_target "$_APP") took $((now - start))s over $(grep -c . <<<"$_DEMAND_REPOS") repos; DEMAND_REPOS in its app file can narrow it to the repos with self-hosted jobs"
+		if [[ -e "$f.paused" ]]; then
+			rm -f "$f.paused"
+			log "demand: app $_APP's queue scans resumed"
+		fi
+		gap=$DEMAND_POLL_SEC
+		read -r rem reset lim 2>/dev/null <"$f.rate" || :
+		if [[ "$rem" =~ ^[0-9]+$ && "$reset" =~ ^[0-9]+$ && "$lim" =~ ^[0-9]+$ ]] && ((reset > now)); then
+			cost=0
+			[[ "$rem0" =~ ^[0-9]+$ && "$reset0" == "$reset" ]] && ((rem0 > rem)) && cost=$((rem0 - rem))
+			reserve="$(demand_rate_reserve "$lim")"
+			budget=$((rem - reserve))
+			if ((budget <= 0)); then
+				gap=$((reset - start))
+			elif ((cost > 0)); then
+				gap=$(((cost * (reset - now) + budget - 1) / budget))
+			fi
+			((gap >= DEMAND_POLL_SEC)) || gap=$DEMAND_POLL_SEC
+			# Logged when pacing starts, not on every scan.
+			if ((gap > DEMAND_POLL_SEC)) && ((next - at <= DEMAND_POLL_SEC)); then
+				log "demand: scanning $(app_target "$_APP") costs ${cost} of its ${rem} remaining GitHub requests; scanning every ${gap}s instead of every ${DEMAND_POLL_SEC}s until the limit resets at $(date -d "@$reset" +%H:%M:%S)"
+			fi
+		fi
+		if ! { printf '%s %s\n%s\n' "$start" "$((start + gap))" "$jobs" >"$f.$BASHPID" && mv -f "$f.$BASHPID" "$f"; }; then
 			log "demand: WARN could not share the queue of app $_APP under $d"
 		fi
 		printf '%s\n' "$jobs"
@@ -1705,7 +1779,7 @@ demand_fits() {
 # _DEMAND_APP; 1: none; 2: GitHub could not be asked for any app that had
 # none. Must run in the supervisor shell: it keeps the state above.
 demand_check() {
-	local slot="$1" only="${2:-}" jobs have extra id repo labels now tok a i n err=0 order=()
+	local slot="$1" only="${2:-}" jobs have extra id repo labels now tok a i n rc err=0 order=()
 	now=$(date +%s)
 	_DEMAND_AT=$now
 	_DEMAND_JOB=""
@@ -1732,8 +1806,11 @@ demand_check() {
 			_TOKEN="$tok"
 			_TOKEN_EXP=$((now + 3600))
 		fi
-		if ! jobs="$(demand_app_jobs)"; then
-			multi_app && log "demand: WARN could not read the Actions queue of app $a ($(app_target "$a"))"
+		rc=0
+		jobs="$(demand_app_jobs)" || rc=$?
+		if ((rc)); then
+			# A pause was logged once when it began.
+			((rc == 3)) || ! multi_app || log "demand: WARN could not read the Actions queue of app $a ($(app_target "$a"))"
 			err=1
 			continue
 		fi
@@ -1884,13 +1961,18 @@ cmd_demand() {
 	local n rc found=0
 	# Run by hand as root, a shared cache would come out root-owned and
 	# unwritable for the supervisors.
-	_DEMAND_QUEUE_DIR="$(mktemp -d)" || die "could not create a temp directory"
+	local tmp=()
+	if [[ -z "$_DEMAND_QUEUE_DIR" ]]; then
+		_DEMAND_QUEUE_DIR="$(mktemp -d)" || die "could not create a temp directory"
+		tmp+=("$_DEMAND_QUEUE_DIR")
+	fi
 	if ((EUID == 0)) && [[ -z "$DEMAND_CACHE" ]]; then
 		DEMAND_CACHE="$(mktemp -d)" || die "could not create a temp directory"
-		trap 'rm -rf "$DEMAND_CACHE" "$_DEMAND_QUEUE_DIR"' EXIT
-	else
-		trap 'rm -rf "$_DEMAND_QUEUE_DIR"' EXIT
+		tmp+=("$DEMAND_CACHE")
 	fi
+	# Global: the trap runs after this function's locals are gone.
+	_DEMAND_TMP=("${tmp[@]}")
+	((${#tmp[@]} == 0)) || trap 'rm -rf "${_DEMAND_TMP[@]}"' EXIT
 	while read -r n; do
 		[[ -n "$n" ]] || continue
 		slot_on_demand "$n" || continue
@@ -5421,6 +5503,132 @@ cmd_bundle() {
 	log "wrote $out: apps ${APPS[*]}, $(wc -c <"$out") bytes; it holds every credential of this pool, so move it like a key and delete it after use"
 }
 
+# Makes this host a member of the pool in bundle $1, using this checkout's code
+# instead of the bundle's: installs the pool's config, apps and keys, keeps this
+# host's own sizing and identity keys from its old config, then runs deps, the
+# image build when there is none, the isolation rules, doctor and install.
+# $2 is the slot count (default: the installed fleet size, else capacity's
+# recommendation). --config-only stops after the config.
+cmd_join() {
+	[[ $EUID -eq 0 ]] || die "join installs credentials and must run as root"
+	local only=0
+	if [[ "${1:-}" == --config-only ]]; then
+		only=1
+		shift
+	fi
+	local file="${1:-}" count="${2:-}" stage sum backup="" old=() a
+	[[ -n "$file" ]] || die "usage: $SELF join [--config-only] <bundle file> [slots]"
+	[[ -r "$file" ]] || die "cannot read $file"
+	[[ -z "$count" || "$count" =~ ^[1-9][0-9]*$ ]] || die "slot count must be a positive number, not '$count'"
+	sum="$(sed -n 's/^BUNDLE_SHA256=\([0-9a-f]\{64\}\)$/\1/p' "$file" | head -n 1)"
+	if [[ -z "$sum" ]] || ! grep -qx BUNDLE_PAYLOAD "$file"; then
+		die "$file is not a gha-vm bundle (make one with: sudo gha-vm bundle)"
+	fi
+
+	stage="$(mktemp -d)" || die "could not create a staging directory"
+	chmod 0700 "$stage"
+	# Global: the trap runs after this function's locals are gone.
+	_JOIN_STAGE="$stage"
+	trap 'find "$_JOIN_STAGE" -type f -exec shred -u {} + 2>/dev/null; rm -rf "$_JOIN_STAGE"' EXIT
+	sed '1,/^BUNDLE_PAYLOAD$/d' "$file" | tr -d '\r' | base64 -d >"$stage/payload.tgz" 2>/dev/null ||
+		die "$file: payload is damaged (not valid base64); copy the file again"
+	printf '%s  %s\n' "$sum" "$stage/payload.tgz" | sha256sum -c --quiet - >/dev/null 2>&1 ||
+		die "$file: payload is damaged (checksum mismatch); copy the file again"
+	tar -xzf "$stage/payload.tgz" -C "$stage" --no-same-owner secrets || die "$file: payload has no secrets/"
+	local sec="$stage/secrets"
+	[[ -r "$sec/config.env" ]] || die "$file: payload has no config.env"
+
+	if [[ -e "$CONFIG" ]]; then
+		backup="/root/gha-vm-etc-before-join-$(date +%Y%m%d-%H%M%S)"
+		cp -a "${CONFIG%/*}" "$backup" || die "could not back up ${CONFIG%/*} to $backup"
+		chmod 0700 "$backup"
+		log "kept the old config in $backup (root only)"
+		for a in "${APPS[@]}"; do old+=("$(app_target "$a")"); done
+		join_keep_host_keys "$CONFIG" "$sec/config.env"
+	fi
+
+	if ((only)); then
+		getent group "$GHA_USER" >/dev/null || die "group $GHA_USER does not exist yet; run $SELF deps first"
+	else
+		cmd_deps
+	fi
+	join_install_config "$sec"
+	"$SELF" apps || die "the pool config does not load on this host; the old one is in ${backup:-<none>}"
+	join_dropped_targets "${old[@]}"
+	if ((only)); then
+		log "pool config installed; finish with: $SELF bootstrap <slots> (or $SELF restart all on a host already set up)"
+		return 0
+	fi
+
+	if [[ -f "$GOLDEN" ]]; then
+		log "golden image present, skipping the build (rebuild with: $SELF image)"
+	else
+		"$SELF" image || die "image build failed"
+	fi
+	"$SELF" net || die "could not apply the isolation rules"
+	"$SELF" doctor ||
+		die "doctor reported problems; try $SELF repair, then re-run $SELF join $file ${count}"
+	if [[ -z "$count" ]] && [[ -z "$(enabled_slots | tail -n 1)" ]]; then
+		count="$("$SELF" capacity | awk '/^recommended/{print $2}')"
+		[[ -n "$count" ]] || die "capacity gave no slot count; pass one: $SELF join $file <slots>"
+	fi
+	"$SELF" install ${count:+"$count"} || die "install failed"
+	"$SELF" restart all || die "restart failed; see: journalctl -u 'gha-vm@*'"
+	log "joined the pool; delete the bundle now: shred -u $file"
+	log "later code updates: git pull, then sudo ./gha-vm.sh install"
+}
+
+# Copies this host's own sizing and identity keys ($BUNDLE_HOST_KEYS_RE) from
+# its current config $1 into the incoming pool config $2, which a bundle ships
+# without them.
+join_keep_host_keys() {
+	local cur="$1" new="$2" line k kept=()
+	while IFS= read -r line; do
+		k="${line%%=*}"
+		[[ "$k" =~ $BUNDLE_HOST_KEYS_RE ]] || continue
+		printf '%s\n' "$line" >>"$new"
+		kept+=("$k")
+	done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$cur")
+	if grep -E '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' "$cur" |
+		grep -Ev '^[A-Za-z_][A-Za-z0-9_]*=' | sed -E 's/^[[:space:]]*(export[[:space:]]+)?([^=]*)=.*/\2/' |
+		grep -Eq "$BUNDLE_HOST_KEYS_RE"; then
+		die "$cur sets a host key indented or with export; write it as a plain KEY= line and rerun"
+	fi
+	((${#kept[@]} == 0)) || log "kept this host's own ${kept[*]}"
+}
+
+# Installs the pool's config.env, app.pem, apps.d and image.d from $1 into the
+# config directory, replacing the apps this host had.
+join_install_config() {
+	local sec="$1" dir="${CONFIG%/*}" f
+	install -d -o root -g "$GHA_USER" -m 0750 "$dir"
+	install -o root -g "$GHA_USER" -m 0640 "$sec/config.env" "$CONFIG"
+	[[ ! -f "$sec/app.pem" ]] || install -o root -g "$GHA_USER" -m 0640 "$sec/app.pem" "$dir/app.pem"
+	rm -rf "$APPS_DIR"
+	if [[ -d "$sec/apps.d" ]]; then
+		install -d -o root -g "$GHA_USER" -m 0750 "$APPS_DIR"
+		for f in "$sec/apps.d"/*; do
+			install -o root -g "$GHA_USER" -m 0640 "$f" "$APPS_DIR/"
+		done
+	fi
+	if [[ -d "$sec/image.d" ]]; then
+		install -d -o root -g "$GHA_USER" -m 0750 "$dir/image.d"
+		cp -R "$sec/image.d/." "$dir/image.d/"
+		chown -R "root:$GHA_USER" "$dir/image.d"
+	fi
+	log "installed the pool config into $dir (values not shown)"
+}
+
+# Warns about each org or repo ($@) this host served before the join that the
+# pool's apps do not cover.
+join_dropped_targets() {
+	local t now
+	now="$("$SELF" apps | cut -f2)"
+	for t in "$@"; do
+		awk -v t="$t" '$2 == t { f = 1 } END { exit !f }' <<<"$now" || log "WARN: this host served $t before the join; the pool does not, so it stops being served here"
+	done
+}
+
 # The instructions at the top of a bundle: $1 source host, $2 revision, $3
 # the host keys left out, $4 the bundle's file name.
 bundle_head() {
@@ -5437,6 +5645,12 @@ a VM only when a queued job in one of the apps' orgs fits it, and registers
 that VM with that job's org. This file is a self-extracting bundle made on
 host "$1". Never print, cat or Read the payload, any .pem, config.env or
 apps.d/*.env values (GITHUB_PAT especially); refer to them by path.
+
+Shortcut when this machine has a git checkout of the same repo: run
+  cd <checkout>/gha-runner && git pull && sudo ./gha-vm.sh join ~/$4
+It does steps 3 to 6 below with the checkout's code (backup of an existing
+/etc/gha-vm, this host's own sizing keys kept, deps, image, isolation, doctor,
+install, restart). Then do step 7 for ~/$4 only and step 8.
 
 1. Preflight: Ubuntu 26.04, /dev/kvm present, CPU exposes VT-x/SVM
    (grep -cE 'vmx|svm' /proc/cpuinfo > 0), and /var/lib/gha-vm on fast local
@@ -5614,6 +5828,10 @@ main() {
 	bundle)
 		load_config
 		cmd_bundle "$@"
+		;;
+	join)
+		load_config_optional
+		cmd_join "$@"
 		;;
 	drain)
 		load_config
