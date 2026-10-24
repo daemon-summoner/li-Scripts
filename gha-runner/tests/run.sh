@@ -379,7 +379,7 @@ $verify_out"
 	install -d "$dm/bin" "$dm/api" "$dm/run"
 	cat >"$dm/bin/curl" <<SH
 #!/bin/bash
-cat >/dev/null
+tok="\$(sed -n 's/^Authorization: Bearer //p')"
 hdr="" url="" inm=""
 while ((\$#)); do
 	case "\$1" in
@@ -392,6 +392,7 @@ while ((\$#)); do
 done
 path="\${url#https://api.github.com}"
 echo "\$path\${inm:+ inm}" >>"$dm/log"
+echo "\$tok \$path" >>"$dm/toklog"
 f="$dm/api/\$(printf '%s' "\$path" | sha256sum | cut -c1-16)"
 [[ -e "\$f" ]] || { printf '{"message":"Not Found"}\n404'; exit 0; }
 code=200
@@ -483,6 +484,132 @@ SH
 	fleet_env <<<"$dcfg"$'\nDEMAND_POLL_SEC=0'
 	if dout="$(dm_run)"; then fail "DEMAND_POLL_SEC=0 accepted"; fi
 	pass "on-demand slots start only for a queued job asking for their labels"
+
+	# Several apps: apps.d/<name>.env adds a second org, and every slot turns
+	# on demand. Each org's requests must go out with that org's credential,
+	# a slot without extra labels takes a plain job from either org, and a
+	# job another slot claimed is left to it.
+	rm -f "$dm/api/"*.code
+	local ma=$fl/apps.d
+	install -d -m 0750 -g gha "$ma"
+	printf 'SCOPE=org\nGITHUB_ORG=other-org\nAUTH_MODE=pat\nGITHUB_PAT=pat2\n' >"$ma/two.env"
+	chmod 0640 "$ma/two.env"
+	chgrp gha "$ma/two.env"
+	gh_api '/orgs/other-org/repos?type=all&per_page=100&page=1' '[{"full_name":"other-org/x","archived":false}]'
+	gh_api '/repos/other-org/x/actions/runs?status=queued&per_page=100' '{"workflow_runs":[{"id":9,"updated_at":"2026-01-01T00:00:00Z"}]}'
+	gh_api '/repos/other-org/x/actions/runs?status=in_progress&per_page=100' '{"workflow_runs":[]}'
+	gh_api '/repos/other-org/x/actions/runs/9/jobs?filter=latest&per_page=100' \
+		'{"jobs":[{"id":90,"status":"queued","labels":["self-hosted","linux"]}]}'
+	gh_api '/repos/example-org/a/actions/runs?status=queued&per_page=100' '{"workflow_runs":[{"id":7,"updated_at":"2026-01-01T00:00:00Z"}]}'
+	local mcfg="$dcfg"$'\nVM_CPUS_2=4'
+	ma_run() {
+		chmod 0640 "$fl/cfg.env"
+		PATH="$dm/bin:$PATH" GHA_CONFIG=$fl/cfg.env GHA_DEMAND_CACHE=$dm/run/.mcache "$gha" "$@" 2>&1
+	}
+	fleet_env <<<"$mcfg"
+	: >"$dm/toklog"
+	dout="$(ma_run demand)" || fail "demand with two apps exited non-zero: $dout"
+	[[ "$dout" == $'slot 1: wanted by job 82 in example-org/a (app main)\nslot 2: wanted by job 70 in example-org/a (app main)' ]] ||
+		fail "with two apps, slot 1 should take the large job and the plain slot 2 a plain one, main's first: $dout"
+	# The slots share one scan per app instead of each walking the queue.
+	[[ "$(grep -c '^test /repos/example-org/a/actions/runs?status=queued' "$dm/toklog")" == 1 ]] ||
+		fail "two slots should share one scan of main's queue: $(grep -c 'example-org/a/actions/runs?status=queued' "$dm/toklog") listings"
+	gh_api '/repos/example-org/a/actions/runs/7/jobs?filter=latest&per_page=100' '{"jobs":[]}'
+	gh_api '/repos/example-org/a/actions/runs?status=queued&per_page=100' '{"workflow_runs":[{"id":7,"updated_at":"2026-01-01T00:02:00Z"}]}'
+	dout="$(ma_run demand)" || fail "demand with two apps exited non-zero: $dout"
+	[[ "$(sed -n 2p <<<"$dout")" == "slot 2: wanted by job 90 in other-org/x (app two)" ]] ||
+		fail "a plain job in the second org should start the plain slot: $dout"
+	grep -q '^pat2 /repos/other-org/x/actions/runs?status=queued' "$dm/toklog" ||
+		fail "the second app's queue was not read with its own credential: $(<"$dm/toklog")"
+	grep -Eq '^pat2 .*example-org|^test .*other-org' "$dm/toklog" &&
+		fail "an org was asked with the other app's credential: $(grep -E '^pat2 .*example-org|^test .*other-org' "$dm/toklog")"
+	install -d "$dm/run/.demand-claims"
+	echo 7 >"$dm/run/.demand-claims/90"
+	dout="$(ma_run demand)" || fail "demand exited non-zero with a claim: $dout"
+	[[ "$(sed -n 2p <<<"$dout")" == "slot 2: idle; no queued job asks for only labels it carries" ]] ||
+		fail "a job slot 7 claimed should not start slot 2: $dout"
+	touch -d '-20 minutes' "$dm/run/.demand-claims/90"
+	dout="$(ma_run demand)" || fail "demand exited non-zero with a lapsed claim: $dout"
+	[[ "$(sed -n 2p <<<"$dout")" == "slot 2: wanted by job 90 in other-org/x (app two)" ]] ||
+		fail "a lapsed claim should not hold the job: $dout"
+	rm -rf "$dm/run/.demand-claims"
+
+	dout="$(ma_run apps)" || fail "apps exited non-zero: $dout"
+	grep -qxF "$(printf 'main\torg example-org\tgroup id 1\tpat <set>\t%s' "$fl/cfg.env")" <<<"$dout" || fail "apps did not list main: $dout"
+	grep -qxF "$(printf 'two\torg other-org\tgroup id 1\tpat <set>\t%s' "$ma/two.env")" <<<"$dout" || fail "apps did not list two: $dout"
+	grep -q pat2 <<<"$dout" && fail "apps printed a PAT: $dout"
+	dout="$(ma_run doctor)" || :
+	grep -q '^-- app two (other-org) --$' <<<"$dout" || fail "doctor did not check the second app: $dout"
+	[[ "$(grep -c '^queued-job access (on-demand slot 1): OK$' <<<"$dout")" == 2 ]] ||
+		fail "doctor should pass the queue of both apps: $(grep -A1 queued-job <<<"$dout")"
+	grep -q "^app two config: OK (640)$" <<<"$dout" || fail "doctor did not check the app file's mode: $dout"
+	# With every slot on demand the queued-job slot pick once died on SIGPIPE
+	# in about one doctor run of four; a few runs catch it.
+	local i
+	for i in 1 2 3 4 5 6; do
+		dout="$(ma_run doctor)" || :
+		[[ "$(grep -c '^queued-job access' <<<"$dout")" == 2 ]] ||
+			fail "doctor stopped before both apps' queue checks (run $i): $(tail -n 3 <<<"$dout")"
+	done
+	# main's runners are unreadable (no fixture); app two's must still be reaped.
+	gh_api '/orgs/other-org/actions/runners?per_page=100&page=1' '{"runners":[{"id":41,"name":"gha-test-9-x","status":"offline"}]}'
+	if dout="$(ma_run reap)"; then fail "reap passed with main's runners unreadable: $dout"; fi
+	grep -q 'could not list the runners of example-org' <<<"$dout" || fail "reap did not name the unreadable org: $dout"
+	grep -q 'reaping stale runner gha-test-9-x' <<<"$dout" || fail "reap stopped at the first unreadable app: $dout"
+
+	printf 'SCOPE=org\nGITHUB_ORG=o\nAUTH_MODE=pat\nGITHUB_PAT=p\nVM_MEM=4G\n' >"$ma/bad.env"
+	chmod 0640 "$ma/bad.env"
+	if dout="$(ma_run demand)"; then fail "an app file setting VM_MEM was accepted"; fi
+	grep -q 'VM_MEM is not an app key' <<<"$dout" || fail "wrong refusal for a host key in an app file: $dout"
+	printf 'SCOPE=org\nAUTH_MODE=pat\nGITHUB_PAT=p\n' >"$ma/bad.env"
+	if dout="$(ma_run demand)"; then fail "an app without GITHUB_ORG was accepted"; fi
+	grep -q "$ma/bad.env: set GITHUB_ORG" <<<"$dout" || fail "wrong refusal for an app without an org: $dout"
+	rm -f "$ma/bad.env"
+	printf 'SCOPE=org\nGITHUB_ORG=o\nAUTH_MODE=pat\nGITHUB_PAT=p\n' >"$ma/main.env"
+	if dout="$(ma_run demand)"; then fail "an app file named main.env was accepted"; fi
+	rm -f "$ma/main.env"
+	pass "several apps: each org read with its own credential, plain slots shared, claims honoured, bad app files refused"
+
+	# bundle: the checkout plus the pool's config without this host's keys,
+	# every app file, every key at the path the receiving host installs it to.
+	printf 'k3\n' >"$fl/three.pem"
+	printf 'SCOPE=repo\nGITHUB_REPO=third/r\nAUTH_MODE=app\nGITHUB_APP_ID=5\nGITHUB_APP_KEY=%s\n' "$fl/three.pem" >"$ma/three.env"
+	chmod 0640 "$ma/three.env"
+	local bx=/tmp/bundle
+	rm -rf "$bx"
+	install -d "$bx"
+	dout="$(GHA_CONFIG=$fl/cfg.env /src/gha-vm.sh bundle "$bx/b.sh" 2>&1)" || fail "bundle exited non-zero: $dout"
+	sed '/^BUNDLE_PAYLOAD$/q' "$bx/b.sh" | grep -Eq 'pat2|GITHUB_PAT=test|k3' && fail "bundle head carries a secret"
+	grep -q '^2. Extract: bash ~/b.sh$' "$bx/b.sh" || fail "bundle head does not name its own file: $(grep 'Extract:' "$bx/b.sh")"
+	grep -Eq '^   \(sizing, slot classes, arch, runner-name prefix\): .*NAME_PREFIX .*VM_MEM_1' "$bx/b.sh" ||
+		fail "bundle head does not name the stripped keys: $(grep -A1 'were stripped' "$bx/b.sh")"
+	dout="$(HOME=$bx bash "$bx/b.sh" 2>&1)" || fail "bundle did not extract: $dout"
+	local bs=$bx/gha-vm-transfer/secrets
+	install -d -m 0755 "$bx/shared"
+	dout="$(bash "$bx/b.sh" "$bx/shared" 2>&1)" || fail "bundle did not extract into an existing directory: $dout"
+	[[ "$(stat -c %a "$bx/shared")" == 755 ]] || fail "extracting changed an existing directory's mode"
+	[[ "$(stat -c %a "$bx/shared/secrets")" == 700 ]] || fail "extracted secrets are not 0700"
+	[[ -x $bx/gha-vm-transfer/gha-runner/gha-vm.sh && -r $bx/gha-vm-transfer/gha-runner/setup.sh ]] || fail "bundle lacks the code"
+	grep -Eq '^(VM_MEM_1|FLEET_MEM|NAME_PREFIX|HOST_PROFILE|NET_HOST_ADDRS)=' "$bs/config.env" && fail "bundle kept a host key: $(<"$bs/config.env")"
+	grep -q '^GITHUB_ORG=example-org$' "$bs/config.env" || fail "bundle lost the pool's org"
+	grep -q '^GITHUB_PAT=pat2$' "$bs/apps.d/two.env" || fail "bundle lost app two"
+	grep -q '^GITHUB_APP_KEY=/etc/gha-vm/apps.d/three.pem$' "$bs/apps.d/three.env" || fail "bundle did not point app three at its installed key"
+	[[ "$(<"$bs/apps.d/three.pem")" == k3 ]] || fail "bundle lost app three's key"
+	grep -qx VM_MEM_1 "$bs/removed-keys.txt" || fail "removed-keys.txt does not list VM_MEM_1"
+	[[ "$(stat -c %a "$bx/b.sh")" == 600 ]] || fail "bundle file is not 0600"
+	if dout="$(HOME=$bx bash "$bx/b.sh" 2>&1)"; then fail "bundle extracted over an existing secrets copy"; fi
+	sed -i '$ s/^\(.\)/\1\1/' "$bx/b.sh"
+	rm -rf "$bx/gha-vm-transfer"
+	if dout="$(HOME=$bx bash "$bx/b.sh" 2>&1)"; then fail "a damaged bundle extracted"; fi
+	if dout="$(GHA_CONFIG=$fl/cfg.env /src/gha-vm.sh bundle "$bx/b.sh" 2>&1)"; then fail "bundle overwrote an existing file"; fi
+	install -m 0640 "$fl/cfg.env" "$fl/cfgx.env"
+	echo 'export NAME_PREFIX=gha-x' >>"$fl/cfgx.env"
+	if dout="$(GHA_CONFIG=$fl/cfgx.env /src/gha-vm.sh bundle "$bx/x.sh" 2>&1)"; then fail "bundle kept an exported NAME_PREFIX"; fi
+	grep -q 'sets NAME_PREFIX indented or with export' <<<"$dout" || fail "wrong refusal for an exported host key: $dout"
+	[[ -e $bx/x.sh ]] && fail "a refused bundle left a file behind"
+	rm -f "$fl/cfgx.env"
+	rm -rf "$ma" "$fl/three.pem" "$bx"
+	pass "bundle carries the code, the pool config minus host keys, every app and key, and refuses damage"
 
 	# restart: an idle runner is not a running job. Slots 2 (idle) and 3 (a
 	# job's run dir left by a killed supervisor) restart at once, slot 1 once

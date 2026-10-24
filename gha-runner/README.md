@@ -397,7 +397,63 @@ gha-vm demand     # which queued job each on-demand slot would start for now
 gha-vm fleet      # an idle one shows "on demand: no VM until a queued job asks for large"
 ```
 
-### The two plans
+### Several GitHub Apps
+
+One fleet can serve several orgs, each through its own GitHub App (or PAT),
+on the same slots. `config.env`'s credentials are the app `main`; every
+`/etc/gha-vm/apps.d/<name>.env` (`root:gha 0640`, the directory `0750`) adds
+one. An app file may set only `AUTH_MODE`, `GITHUB_APP_ID`, `GITHUB_APP_KEY`,
+`GITHUB_PAT`, `SCOPE`, `GITHUB_ORG`, `GITHUB_REPO`, `RUNNER_GROUP`,
+`RUNNER_GROUP_ID` and `DEMAND_REPOS`; anything else fails the load. Sizing,
+labels, the image, `image.d` and the isolation rules stay the host's, shared by
+every app, so every org's jobs run on the same golden image. All apps talk to
+the one `GITHUB_SERVER_URL`.
+
+```bash
+# /etc/gha-vm/apps.d/second.env
+SCOPE=org
+GITHUB_ORG=second-org
+AUTH_MODE=app
+GITHUB_APP_ID=234567
+GITHUB_APP_KEY=/etc/gha-vm/apps.d/second.pem
+RUNNER_GROUP=gha-vm
+```
+
+A runner registers with exactly one org, so a standing idle runner could only
+ever take its own org's jobs. With two or more apps every slot is therefore on
+demand: it polls every app's queue (each with its own token, starting from a
+different app each poll so a busy org cannot hide the other's jobs; the host's
+slots share one scan per app per `DEMAND_POLL_SEC`, and a scan slower than
+that logs a warning naming `DEMAND_REPOS` as the fix) and boots
+once a queued job fits it, registering that VM with that job's org. A slot with
+`RUNNER_LABELS_EXTRA_<n>` still starts only for a job asking for one of those
+labels; every other slot starts for any job whose labels it all carries, such
+as plain `[self-hosted, linux]`. The slots of one host claim a job before
+booting for it (`RUN_DIR/.demand-claims`), so one queued job boots one VM per
+host (single-app hosts with on-demand slots claim too); a slot that gives up
+on the job releases its claim, and an abandoned one lapses after
+`BOOT_TIMEOUT + DEMAND_IDLE_SEC`. Two hosts can
+both boot for the same job: the one that does not get it takes the next queued
+job of that org or stops after `DEMAND_IDLE_SEC`.
+
+Every job waits the on-demand latency above. Each app needs the queued-job
+permission (Actions: read) as well as runner admin, and `doctor` checks auth,
+runner admin, the queue, the runner group and public-repo exposure for each
+app. `reap`, `clean`, `status` and `demand` cover every app.
+
+```bash
+sudo gha-vm apps      # each app, where it registers, which credential (secrets by path only)
+sudo gha-vm doctor    # one "-- app <name> (<org>) --" block per extra app
+```
+
+`sudo ./gha-vm.sh bundle [file]`, run from the checkout, writes a
+self-extracting script (default `~/gha-vm-bundle.sh`, mode 0600) that sets
+another host up as a member of this pool: the checkout, `config.env` without
+this host's sizing and identity keys, every app file and key, and `image.d`.
+Its head holds step-by-step instructions; everything after `BUNDLE_PAYLOAD` is
+the secret archive. It holds every credential of the pool: move it like a key
+and delete it once extracted.
+
 
 | | dedicated CI box | `services` |
 |---|---|---|
@@ -747,11 +803,13 @@ fleet accounting are checked against a fixture cgroup tree via
 | `tests/` | render/verify suite and its expected units and ruleset |
 | `/etc/gha-vm/profiles/local.env` | this host's overrides; never rewritten by `deps` |
 | `/etc/gha-vm/image.d/*.sh` | image build hooks (`IMAGE_HOOK_DIR`) |
+| `/etc/gha-vm/apps.d/<name>.env` | one more GitHub App (org) the slots serve; see "Several GitHub Apps" |
 | `/etc/gha-vm/env` | optional `KEY=value` lines the units load as environment; wins over every config file, only for the slot and upgrade units |
 | `/etc/gha-vm/nftables.conf` | generated isolation ruleset, included from `/etc/nftables.conf` |
 | `/var/lib/gha-vm/golden.qcow2` | golden image, backing file for every overlay |
 | `/var/lib/gha-vm/golden.qcow2.prev` | the previous golden image, for `rollback` |
-| `/var/lib/gha-vm/run/<name>/` | one live VM: overlay, seed, UEFI vars, console log |
+| `/var/lib/gha-vm/run/<name>/` | one live VM: overlay, seed, UEFI vars, console log, the app it registered with |
+| `/var/lib/gha-vm/run/.demand-claims/<job id>` | which slot booted for a queued job, so the host's other slots skip it |
 | `/var/lib/gha-vm/run/.slot-<n>.drain` | drain flag; the slot idles while it exists |
 | `/var/lib/gha-vm/run/.slot-<n>.wait` | the slot is waiting for fleet memory, since this epoch |
 | `/var/lib/gha-vm/run/.slot-<n>.claim` | memory a running VM may still grow into, counted until it exits |
