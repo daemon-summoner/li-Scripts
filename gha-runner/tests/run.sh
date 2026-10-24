@@ -398,7 +398,15 @@ f="$dm/api/\$(printf '%s' "\$path" | sha256sum | cut -c1-16)"
 code=200
 [[ -e "\$f.code" ]] && code="\$(<"\$f.code")"
 etag="\"\$(sha256sum "\$f" | cut -c1-12)\""
-[[ -n "\$hdr" ]] && printf 'HTTP/2 %s\r\netag: %s\r\n\r\n' "\$code" "\$etag" >"\$hdr"
+if [[ -n "\$hdr" ]]; then
+	{
+		printf 'HTTP/2 %s\r\netag: %s\r\n' "\$code" "\$etag"
+		# "<remaining> <reset epoch> <limit>" in $dm/rate become rate-limit headers.
+		[[ -r "$dm/rate" ]] && read -r rr rt rl <"$dm/rate" &&
+			printf 'x-ratelimit-remaining: %s\r\nx-ratelimit-reset: %s\r\nx-ratelimit-limit: %s\r\n' "\$rr" "\$rt" "\$rl"
+		printf '\r\n'
+	} >"\$hdr"
+fi
 [[ "\$code" == 200 && "\$inm" == "\$etag" ]] && { printf '\n304'; exit 0; }
 cat "\$f"
 printf '\n%s' "\$code"
@@ -534,6 +542,45 @@ SH
 		fail "a lapsed claim should not hold the job: $dout"
 	rm -rf "$dm/run/.demand-claims"
 
+	# Rate-limit pacing. GHA_DEMAND_QUEUE keeps the shared scans across runs,
+	# as a host's slots share them, and $dm/rate feeds the rate-limit headers.
+	local q=$dm/run/.q reset a n
+	reset=$(($(date +%s) + 3600))
+	qa_run() { GHA_DEMAND_QUEUE=$q ma_run "$@"; }
+	echo "4000 $reset 5000" >"$dm/rate"
+	dout="$(qa_run demand)" || fail "demand with a shared queue exited non-zero: $dout"
+	: >"$dm/toklog"
+	dout="$(qa_run demand)" || fail "demand with a shared queue exited non-zero: $dout"
+	grep -q 'example-org/a/actions/runs' "$dm/toklog" && fail "a fresh shared scan was not reused: $(<"$dm/toklog")"
+	# This scan costs 200 requests; spread over the 3300 left above the reserve
+	# for the rest of the hour, the next is due in about 218s, not 30s.
+	sed -i '1s/.*/1 1/' "$q/main"
+	echo "3800 $reset 5000" >"$dm/rate"
+	dout="$(qa_run demand)" || fail "demand exited non-zero while pacing: $dout"
+	grep -q 'scanning example-org costs 200 of its 3800 remaining GitHub requests; scanning every 2[01][0-9]s' <<<"$dout" ||
+		fail "pacing did not start or was not logged: $dout"
+	read -r a n <"$q/main"
+	((n - a > 200)) || fail "pacing should push the next scan past 200s, got $((n - a))s"
+	# Below the reserve the next scan waits for the reset, and a due one is
+	# skipped without asking GitHub.
+	sed -i '1s/.*/1 1/' "$q/main"
+	echo "50 $reset 5000" >"$dm/rate"
+	dout="$(qa_run demand)" || fail "demand exited non-zero near the limit: $dout"
+	read -r a n <"$q/main"
+	((n >= reset - 5)) || fail "a scan leaving less than the reserve should wait for the reset: next in $((n - a))s"
+	sed -i '1s/.*/1 1/' "$q/main"
+	: >"$dm/toklog"
+	dout="$(qa_run demand)" || :
+	grep -q 'rate limit of app main (example-org) is down to 50; pausing its queue scans until' <<<"$dout" ||
+		fail "a spent rate limit did not pause the scans: $dout"
+	grep -q 'example-org/a/actions/runs' "$dm/toklog" && fail "a paused app was still scanned: $(<"$dm/toklog")"
+	# A new window resumes them.
+	echo "50 $(($(date +%s) - 1)) 5000" >"$q/main.rate"
+	echo "4990 $((reset + 3600)) 5000" >"$dm/rate"
+	dout="$(qa_run demand)" || fail "demand exited non-zero after the reset: $dout"
+	grep -q "app main's queue scans resumed" <<<"$dout" || fail "scans did not resume after the reset: $dout"
+	rm -rf "$q" "$dm/rate"
+
 	dout="$(ma_run apps)" || fail "apps exited non-zero: $dout"
 	grep -qxF "$(printf 'main\torg example-org\tgroup id 1\tpat <set>\t%s' "$fl/cfg.env")" <<<"$dout" || fail "apps did not list main: $dout"
 	grep -qxF "$(printf 'two\torg other-org\tgroup id 1\tpat <set>\t%s' "$ma/two.env")" <<<"$dout" || fail "apps did not list two: $dout"
@@ -597,10 +644,46 @@ SH
 	[[ "$(<"$bs/apps.d/three.pem")" == k3 ]] || fail "bundle lost app three's key"
 	grep -qx VM_MEM_1 "$bs/removed-keys.txt" || fail "removed-keys.txt does not list VM_MEM_1"
 	[[ "$(stat -c %a "$bx/b.sh")" == 600 ]] || fail "bundle file is not 0600"
+
+	# join --config-only: a host with its own config takes the pool's apps and
+	# keys but keeps its own sizing and identity keys.
+	local jh=$bx/host
+	install -d -m 0750 -g gha "$jh" "$jh/apps.d"
+	grep -Ev '^(NAME_PREFIX|VM_MEM_1|GITHUB_ORG)=' "$fl/cfg.env" >"$jh/config.env"
+	printf 'GITHUB_ORG=old-org\nNAME_PREFIX=gha-recv\nVM_MEM_1=12G\n' >>"$jh/config.env"
+	printf 'SCOPE=org\nGITHUB_ORG=stale-org\nAUTH_MODE=pat\nGITHUB_PAT=p\n' >"$jh/apps.d/stale.env"
+	chmod 0640 "$jh/config.env" "$jh/apps.d/stale.env"
+	chgrp gha "$jh/config.env" "$jh/apps.d/stale.env"
+	rm -rf /root/gha-vm-etc-before-join-*
+	dout="$(GHA_CONFIG=$jh/config.env /src/gha-vm.sh join --config-only "$bx/b.sh" 2>&1)" || fail "join exited non-zero: $dout"
+	grep -q '^GITHUB_ORG=example-org$' "$jh/config.env" || fail "join did not install the pool's org"
+	[[ "$(grep '^NAME_PREFIX=' "$jh/config.env")" == NAME_PREFIX=gha-recv ]] ||
+		fail "join did not keep this host's NAME_PREFIX: $(grep '^NAME_PREFIX=' "$jh/config.env")"
+	grep -q '^VM_MEM_1=12G$' "$jh/config.env" || fail "join did not keep this host's VM_MEM_1"
+	[[ -e $jh/apps.d/stale.env ]] && fail "join kept an app the pool does not have"
+	[[ "$(<"$jh/apps.d/three.pem")" == k3 ]] || fail "join did not install app three's key"
+	[[ "$(stat -c '%a %U:%G' "$jh/apps.d/two.env")" == '640 root:gha' ]] || fail "joined app file is not root:gha 0640"
+	[[ "$(stat -c '%a %U:%G' "$jh/config.env")" == '640 root:gha' ]] || fail "joined config is not root:gha 0640"
+	grep -q 'this host served old-org before the join' <<<"$dout" || fail "join did not warn about the dropped org: $dout"
+	grep -q 'this host served stale-org before the join' <<<"$dout" || fail "join did not warn about the dropped app: $dout"
+	grep -q 'this host served example-org' <<<"$dout" && fail "join warned about an org the pool still serves: $dout"
+	grep -Eq 'pat2|GITHUB_PAT=test|k3' <<<"$dout" && fail "join printed a secret"
+	local jb
+	jb="$(echo /root/gha-vm-etc-before-join-*)"
+	grep -q '^GITHUB_ORG=old-org$' "$jb/config.env" || fail "join did not back up the old config"
+	[[ -e $jb/apps.d/stale.env && "$(stat -c %a "$jb")" == 700 ]] || fail "join backup is incomplete or not root-only"
+	[[ -z "$(find /tmp -maxdepth 2 -path '*/secrets/config.env' -newer "$bx/b.sh" 2>/dev/null)" ]] ||
+		fail "join left the extracted secrets behind"
+	printf 'not a bundle\n' >"$bx/nb.sh"
+	if dout="$(GHA_CONFIG=$jh/config.env /src/gha-vm.sh join --config-only "$bx/nb.sh" 2>&1)"; then fail "join accepted a non-bundle"; fi
+	grep -q 'is not a gha-vm bundle' <<<"$dout" || fail "wrong refusal for a non-bundle: $dout"
+	rm -rf /root/gha-vm-etc-before-join-* "$jh" "$bx/nb.sh"
 	if dout="$(HOME=$bx bash "$bx/b.sh" 2>&1)"; then fail "bundle extracted over an existing secrets copy"; fi
 	sed -i '$ s/^\(.\)/\1\1/' "$bx/b.sh"
 	rm -rf "$bx/gha-vm-transfer"
 	if dout="$(HOME=$bx bash "$bx/b.sh" 2>&1)"; then fail "a damaged bundle extracted"; fi
+	if dout="$(GHA_CONFIG=$fl/cfg.env /src/gha-vm.sh join --config-only "$bx/b.sh" 2>&1)"; then fail "join accepted a damaged bundle"; fi
+	grep -q 'payload is damaged' <<<"$dout" || fail "wrong refusal for a damaged bundle: $dout"
 	if dout="$(GHA_CONFIG=$fl/cfg.env /src/gha-vm.sh bundle "$bx/b.sh" 2>&1)"; then fail "bundle overwrote an existing file"; fi
 	install -m 0640 "$fl/cfg.env" "$fl/cfgx.env"
 	echo 'export NAME_PREFIX=gha-x' >>"$fl/cfgx.env"
@@ -609,7 +692,7 @@ SH
 	[[ -e $bx/x.sh ]] && fail "a refused bundle left a file behind"
 	rm -f "$fl/cfgx.env"
 	rm -rf "$ma" "$fl/three.pem" "$bx"
-	pass "bundle carries the code, the pool config minus host keys, every app and key, and refuses damage"
+	pass "bundle carries the code, the pool config minus host keys, every app and key, and refuses damage; join installs it keeping host keys"
 
 	# restart: an idle runner is not a running job. Slots 2 (idle) and 3 (a
 	# job's run dir left by a killed supervisor) restart at once, slot 1 once

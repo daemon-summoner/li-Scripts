@@ -436,6 +436,16 @@ on the job releases its claim, and an abandoned one lapses after
 both boot for the same job: the one that does not get it takes the next queued
 job of that org or stops after `DEMAND_IDLE_SEC`.
 
+A scan costs about two GitHub requests per watched repo, and each app's
+installation has its own hourly rate limit (5,000 requests or more), shared by
+every host using that app. The scans pace themselves from GitHub's rate-limit
+headers: what the last scan cost is spread over what is left of the hour,
+keeping a tenth of the limit (at least 100) for minting tokens and registering
+runners, and they pause until the reset once only that reserve is left. An org
+with many repos therefore gets scanned less often than every `DEMAND_POLL_SEC`;
+set `DEMAND_REPOS` in its app file to the repos with self-hosted jobs to keep
+it fast.
+
 Every job waits the on-demand latency above. Each app needs the queued-job
 permission (Actions: read) as well as runner admin, and `doctor` checks auth,
 runner admin, the queue, the runner group and public-repo exposure for each
@@ -453,6 +463,26 @@ this host's sizing and identity keys, every app file and key, and `image.d`.
 Its head holds step-by-step instructions; everything after `BUNDLE_PAYLOAD` is
 the secret archive. It holds every credential of the pool: move it like a key
 and delete it once extracted.
+
+A host that already has a checkout of this repo needs only the bundle file.
+Its code comes from `git pull`:
+
+```bash
+cd li-scripts/gha-runner && git pull
+sudo ./gha-vm.sh join ~/gha-vm-bundle.sh   # optional slot count after the file
+shred -u ~/gha-vm-bundle.sh
+```
+
+`join` backs up an existing `/etc/gha-vm` to `/root/gha-vm-etc-before-join-*`.
+It installs the pool's `config.env`, keys, `apps.d` and `image.d`, but keeps
+this host's own sizing and identity keys (`VM_MEM`, `NAME_PREFIX`,
+`FLEET_MEM` and the rest the bundle strips) from its old config. Then it runs
+`deps`, builds the golden image if there is none, applies the isolation rules,
+and stops if `doctor` fails. Otherwise it installs the fleet (keeping its size,
+or the `capacity` recommendation on a first install) and restarts the slots. It
+warns about any org this host served that the pool does not.
+`join --config-only <file>` stops after the config. The bundle is only needed
+once: later code updates are `git pull` and `sudo ./gha-vm.sh install`.
 
 
 | | dedicated CI box | `services` |
