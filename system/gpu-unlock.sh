@@ -12,7 +12,7 @@ TARGETS=all
 TARGETS_GIVEN=0
 SRC_DIR=""
 # 5090s stay at their stock 575W; the entry pins it so a lowered limit does not survive a reboot.
-POWER_LIMIT=3090=310,5090=575
+POWER_LIMIT=3090=300,5090=575
 POWER_UNIT=/etc/systemd/system/nvidia-power-limit.service
 P2P=auto
 REBOOT_NEEDED=0
