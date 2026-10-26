@@ -1158,7 +1158,10 @@ idle_dirs() {
 }
 
 tmp_scan_root() {
-	local root=$1 d name
+	local root=$1 d name keep=(-true)
+	# macOS gives some system services a temp dir under System Integrity Protection (the sunlnk flag); nobody can
+	# remove those, and they hold nothing.
+	[[ $OS == mac ]] && keep=(! -flags +sunlnk)
 	: >"$WORK/tmp.slow"
 	: >"$WORK/tmp.fast"
 	while IFS= read -r d; do
@@ -1168,7 +1171,7 @@ tmp_scan_root() {
 		go-build* | go-link-* | chromedp-runner*) printf '%s\n' "$d" >>"$WORK/tmp.fast" ;;
 		*) [[ $d == "$WORK" ]] || printf '%s\n' "$d" >>"$WORK/tmp.slow" ;;
 		esac
-	done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -user "$USER_NAME" ! -name '.*' ! -name "$NL_GLOB" ! -name "$TAB_GLOB" 2>/dev/null)
+	done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -user "$USER_NAME" "${keep[@]}" ! -name '.*' ! -name "$NL_GLOB" ! -name "$TAB_GLOB" 2>/dev/null)
 	{
 		tr '\n' '\0' <"$WORK/tmp.slow" | idle_dirs $((TEMP_DAYS * 1440))
 		tr '\n' '\0' <"$WORK/tmp.fast" | idle_dirs 1440
