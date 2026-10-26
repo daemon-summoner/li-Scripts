@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# li - run any li-Scripts helper by name: ./li <command> [args...]
+# With no command (or `help`), prints the grouped command list. Every script
+# can still be run directly; this is just a friendlier front door.
+#
+# Usage:
+#   ./li                 list all commands
+#   ./li <command> ...   run a command, passing the rest of the args to it
+#   ./li help            show this list
+# --- end usage ---
+set -Eeuo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+export LI_ROOT="$HERE"
+# shellcheck source=lib/common.sh
+source "$HERE/lib/common.sh"
+
+# Registry: one line per command, "name|group|path|description", in display
+# order. Kept as a newline-delimited string rather than an associative array so
+# the dispatcher runs on the bash 3.2 that still ships as /bin/bash on macOS.
+REGISTRY=""
+reg() { REGISTRY="${REGISTRY}${1}|${2}|${3}|${4}"$'\n'; }
+
+reg setup setup "setup.sh" "set up this machine (cross-platform)"
+
+reg update system "system/update.sh" "update system packages (apt/brew)"
+reg cleanup-disk system "system/cleanup-disk.sh" "reclaim disk space"
+reg benchmark system "system/benchmark.sh" "quick system benchmark (Linux)"
+reg swap-resize system "system/swap-resize.sh" "resize the swap file (Linux)"
+reg zero-free-space system "system/zero-free-space.sh" "zero free space to shrink disk images"
+reg grub-repair system "system/grub-repair.sh" "repair/reinstall GRUB (Linux)"
+reg gpu-unlock system "system/gpu-unlock.sh" "unlock NVIDIA 30/50-series limits (Linux)"
+reg usb-windows11 system "system/usb-windows11.sh" "make a bootable Windows 11 USB (macOS)"
+
+reg scp network "network/scp-helper.sh" "copy files to/from a configured host (scp)"
+reg rsync network "network/rsync-sync.sh" "sync a folder to a configured host (rsync)"
+reg ssh-keygen network "network/ssh-keygen.sh" "generate an SSH key pair"
+reg ufw-allow network "network/ufw-allow.sh" "allow a CIDR through UFW (Linux)"
+reg wsl-to-desktop network "network/wsl-to-desktop.sh" "copy files from WSL to the Windows desktop"
+
+reg docker dev "dev/docker-colima.sh" "install Docker (Colima on macOS, apt on Linux)"
+reg kasm-install dev "dev/kasm-install.sh" "install Kasm Workspaces"
+reg kasm-uninstall dev "dev/kasm-uninstall.sh" "uninstall Kasm Workspaces"
+reg claude-resume dev "dev/claude-resume.sh" "resume the latest Claude Code session"
+
+reg ap-search security "security/kali/ap_search.sh" "scan for Wi-Fi access points (research)"
+reg ap-monitor security "security/kali/ap_monitor.sh" "monitor a Wi-Fi access point (research)"
+reg ap-deauth security "security/kali/ap_deauth.sh" "send deauth frames to a client (research)"
+reg monitor-mode security "security/kali/enable_monitor_mode.sh" "put a Wi-Fi adapter into monitor mode (research)"
+
+list_commands() {
+	printf '\n%sli-Scripts%s -- run a helper by name: %s./li <command> [args]%s\n' "$c_b" "$c_0" "$c_d" "$c_0"
+	local group name g path desc
+	for group in setup system network dev security; do
+		printf '\n  %s%s%s\n' "$c_b" "$group" "$c_0"
+		while IFS='|' read -r name g path desc; do
+			[[ -n "$name" ]] || continue
+			[[ "$g" == "$group" ]] || continue
+			printf '    %s%-16s%s %s%s%s\n' "$c_g" "$name" "$c_0" "$c_d" "$desc" "$c_0"
+		done <<<"$REGISTRY"
+	done
+	printf '\n'
+}
+
+# Interactive picker: numbered, grouped list; pick one and it runs. Shown when
+# `./li` is run bare on a terminal. Indexed arrays (not associative) keep this
+# working on the bash 3.2 that ships as /bin/bash on macOS.
+interactive_menu() {
+	local names=() groups=() paths=() descs=()
+	local name g path desc
+	while IFS='|' read -r name g path desc; do
+		[[ -n "$name" ]] || continue
+		names+=("$name")
+		groups+=("$g")
+		paths+=("$path")
+		descs+=("$desc")
+	done <<<"$REGISTRY"
+
+	local choice group i idx script
+	while true; do
+		printf '\n%sli-Scripts%s -- pick a command to run\n' "$c_b" "$c_0"
+		for group in setup system network dev security; do
+			printf '\n  %s%s%s\n' "$c_b" "$group" "$c_0"
+			for i in "${!names[@]}"; do
+				[[ "${groups[$i]}" == "$group" ]] || continue
+				printf '    %s%2d%s  %s%-16s%s %s%s%s\n' \
+					"$c_g" "$((i + 1))" "$c_0" "$c_b" "${names[$i]}" "$c_0" "$c_d" "${descs[$i]}" "$c_0"
+			done
+		done
+		printf '\n'
+		ask choice "Number to run (or q to quit)"
+		case "$choice" in
+		q | Q | "") info "Nothing selected."; exit 0 ;;
+		esac
+		[[ "$choice" =~ ^[0-9]+$ ]] || { warn "enter a number, or q to quit"; continue; }
+		((choice >= 1 && choice <= ${#names[@]})) || { warn "out of range: $choice"; continue; }
+		idx=$((choice - 1))
+		script="$HERE/${paths[$idx]}"
+		[[ -f "$script" ]] || die "'${names[$idx]}' maps to a missing file: ${paths[$idx]}"
+		step "Running ${names[$idx]}  (same as: ./li ${names[$idx]})"
+		exec bash "$script"
+	done
+}
+
+main() {
+	local cmd="${1:-}"
+	case "$cmd" in
+	help | -h | --help)
+		list_commands
+		exit 0
+		;;
+	"")
+		if [[ -t 0 && -t 1 ]]; then
+			interactive_menu
+		else
+			list_commands
+		fi
+		exit 0
+		;;
+	esac
+
+	local name g path desc target=""
+	while IFS='|' read -r name g path desc; do
+		[[ "$name" == "$cmd" ]] || continue
+		target="$path"
+		break
+	done <<<"$REGISTRY"
+	[[ -n "$target" ]] || die "unknown command: $cmd (try: ./li help)"
+
+	shift
+	local script="$HERE/$target"
+	[[ -f "$script" ]] || die "command '$cmd' maps to a missing file: $target"
+	exec bash "$script" "$@"
+}
+
+main "$@"
