@@ -45,3 +45,15 @@ $RECYCLE.BIN/
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# =========================
+# li-Scripts
+# =========================
+
+# Live, self-seeded config -- never committed. The committed sample is
+# config/config.env.example.
+config/config.env
+
+# Tooling caches and AI scratch space
+.ruff_cache/
+workspace/

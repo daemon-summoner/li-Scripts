@@ -1,0 +1,123 @@
+# li-Scripts managed ~/.bashrc -- shared across Linux and macOS.
+# Safe on both: every modern-tool alias is guarded by `command -v`, so a tool
+# that was not installed simply leaves the stock command in place.
+
+# If not running interactively, don't do anything.
+case $- in
+*i*) ;;
+*) return ;;
+esac
+
+# History.
+HISTCONTROL=ignoreboth
+HISTSIZE=10000
+HISTFILESIZE=20000
+shopt -s histappend
+shopt -s checkwinsize
+
+# Color support for ls/grep where dircolors exists (GNU coreutils).
+if command -v dircolors >/dev/null 2>&1; then
+	test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+	alias grep='grep --color=auto'
+	alias fgrep='fgrep --color=auto'
+	alias egrep='egrep --color=auto'
+fi
+
+# Prefer a Homebrew Python when present (macOS), else the system python3.
+if [ -x /opt/homebrew/bin/python3 ]; then
+	alias python='/opt/homebrew/bin/python3'
+	alias pip='/opt/homebrew/bin/python3 -m pip'
+	alias python3='/opt/homebrew/bin/python3'
+	alias pip3='/opt/homebrew/bin/python3 -m pip'
+elif command -v python3 >/dev/null 2>&1; then
+	alias python='python3'
+	alias pip='pip3'
+fi
+
+# Modern drop-in replacements, each only if the tool is actually installed.
+command -v btop >/dev/null 2>&1 && alias htop='btop' && alias top='btop'
+command -v dust >/dev/null 2>&1 && alias du='dust'
+if command -v eza >/dev/null 2>&1; then
+	alias ls='eza --icons --group-directories-first'
+	alias ll='eza -l --icons --group-directories-first'
+	alias la='eza -la --icons --group-directories-first'
+	alias tree='eza --tree --icons'
+fi
+# Keep the originals reachable under an 'old' prefix.
+alias oldls='command ls'
+command -v btop >/dev/null 2>&1 && alias oldhtop='command htop' && alias oldtop='command top'
+command -v dust >/dev/null 2>&1 && alias olddu='command du'
+
+# Replace vim with LunarVim when it is installed.
+if command -v lvim >/dev/null 2>&1; then
+	alias vim1='command vim'
+	alias vim='lvim'
+fi
+
+# tmux session helpers: tmux1..tmux10 attach-or-create main1..main10.
+for i in {1..10}; do
+	eval "function tmux$i() { tmux attach-session -t main$i || tmux new-session -s main$i; }"
+done
+
+# Python virtualenv helpers.
+mkvenv() {
+	python3 -m venv "${1:-venv}"
+	# shellcheck source=/dev/null
+	source "${1:-venv}/bin/activate"
+}
+activate() {
+	# shellcheck source=/dev/null
+	source "${1:-venv}/bin/activate"
+}
+
+# faster-whisper (library): make a local .venv here with faster-whisper via uv.
+whisper-lib() {
+	uv venv --python 3.12 && uv pip install faster-whisper "$@" &&
+		echo "faster-whisper ready in .venv -- activate with: source .venv/bin/activate"
+}
+
+# Programmable completion (Linux stock, or Homebrew bash-completion on macOS).
+if ! shopt -oq posix; then
+	if [ -f /usr/share/bash-completion/bash_completion ]; then
+		# shellcheck source=/dev/null
+		. /usr/share/bash-completion/bash_completion
+	elif [ -f /etc/bash_completion ]; then
+		# shellcheck source=/dev/null
+		. /etc/bash_completion
+	elif [ -f /opt/homebrew/etc/profile.d/bash_completion.sh ]; then
+		# shellcheck source=/dev/null
+		. /opt/homebrew/etc/profile.d/bash_completion.sh
+	fi
+fi
+
+# NVM (Linux node module installs it; harmless if absent).
+export NVM_DIR="$HOME/.nvm"
+# shellcheck source=/dev/null
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+# shellcheck source=/dev/null
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+
+# Go and user-local binaries on PATH.
+export PATH="$PATH:/usr/local/go/bin:$HOME/go/bin"
+export PATH="$HOME/.local/bin:$PATH"
+
+# FZF key bindings/completion if present.
+# shellcheck source=/dev/null
+[ -f ~/.fzf.bash ] && source ~/.fzf.bash
+
+# Prompt: starship if installed, else a plain colored PS1.
+if command -v starship >/dev/null 2>&1; then
+	eval "$(starship init bash)"
+else
+	PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+fi
+
+# A system snapshot at login, if fastfetch is installed.
+command -v fastfetch >/dev/null 2>&1 && fastfetch
+
+# zoxide must initialize LAST so its `cd` shim wraps everything above.
+if command -v zoxide >/dev/null 2>&1; then
+	eval "$(zoxide init bash)"
+	alias cd='z'
+	alias oldcd='builtin cd'
+fi
