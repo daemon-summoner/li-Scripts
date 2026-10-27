@@ -15,6 +15,10 @@ set -euo pipefail
 # (it runs with --hooks-only); any arguments given here are passed to it, e.g.
 # --no-dmr or --dmr-backend vllm.
 #
+# On macOS it also repairs what leaves brew packages off PATH: a formula brew
+# could not link (conflicting files from another keg, e.g. the deprecated
+# docker-completion) and a Homebrew prefix missing from the shell startup file.
+#
 # Usage:
 #   chmod +x install_docker.sh
 #   ./install_docker.sh [install_colima_docker.sh options]
@@ -95,7 +99,7 @@ resolve_colima_installer() {
 # existing VM as-is.
 install_colima_builtin() {
 	info "Setting up Colima directly (llm-tools installer not found)"
-	brew install colima docker docker-compose
+	brew_install_linked colima docker docker-compose
 	if colima_profile_exists; then
 		info "Existing Colima profile found -- leaving it running"
 		colima status 2>/dev/null || colima start
@@ -114,6 +118,101 @@ colima_profile_exists() {
 	command -v colima &>/dev/null || return 1
 	profiles="$(colima list -j 2>/dev/null)" || return 1
 	grep -q '"name":"default"' <<<"$profiles"
+}
+
+brew_is_linked() { [[ -L "$(brew --prefix)/var/homebrew/linked/$1" ]]; }
+
+# Is formula $1 deprecated or disabled with formula $2 as its replacement?
+brew_replaced_by() {
+	local json field
+	json="$(brew info --json=v2 "$1")"
+	for field in deprecation_replacement_formula disable_replacement_formula; do
+		# plutil fails on a null field, which just means "no replacement".
+		[[ "$(plutil -extract "formulae.0.$field" raw -o - - <<<"$json" 2>/dev/null)" == "$2" ]] && return 0
+	done
+	return 1
+}
+
+# Link a formula into the Homebrew prefix, clearing whatever blocks it. A keg
+# that owns conflicting files and is deprecated in favor of this formula (as
+# docker-completion is for docker) is uninstalled; any other conflict is
+# overwritten, which replaces only the overlapping files, after listing them.
+brew_link_formula() {
+	local formula="$1" prefix listing line dst owner owners=() conflicts=()
+	brew_is_linked "$formula" && return 0
+	if brew link "$formula" &>/dev/null; then
+		info "Linked $formula"
+		return 0
+	fi
+
+	prefix="$(brew --prefix)"
+	listing="$(brew link --overwrite --dry-run "$formula")"
+	while IFS= read -r line; do
+		[[ "$line" == "$prefix"/* ]] || continue
+		dst="${line%% -> *}"
+		conflicts+=("$dst")
+		[[ -L "$dst" && "$(readlink "$dst")" =~ (^|/)Cellar/([^/]+)/ ]] || continue
+		owner="${BASH_REMATCH[2]}"
+		[[ "$owner" != "$formula" && " ${owners[*]-} " != *" $owner "* ]] && owners+=("$owner")
+	done <<<"$listing"
+
+	for owner in ${owners[@]+"${owners[@]}"}; do
+		if brew_replaced_by "$owner" "$formula"; then
+			info "Uninstalling $owner: it is deprecated in favor of $formula and blocks linking it"
+			brew uninstall "$owner" || warn "Could not uninstall $owner; overwriting its files instead"
+		fi
+	done
+	if brew link "$formula" &>/dev/null; then
+		info "Linked $formula"
+		return 0
+	fi
+
+	warn "Overwriting files in $prefix that block linking $formula:"
+	printf '  %s\n' ${conflicts[@]+"${conflicts[@]}"}
+	brew link --overwrite "$formula" || error "Could not link $formula into $prefix"
+}
+
+# brew exits non-zero when it installs a keg but cannot link it, which leaves
+# the formula in the Cellar with nothing on PATH. Install (or upgrade), then
+# repair the links of whatever came out unlinked.
+brew_install_linked() {
+	local formula
+	if ! brew install "$@"; then
+		for formula in "$@"; do
+			brew list --versions "$formula" &>/dev/null || error "brew could not install $formula"
+		done
+		warn "brew installed everything but reported an error; repairing links"
+	fi
+	for formula in "$@"; do
+		brew_link_formula "$formula"
+	done
+}
+
+# New terminals only find a prefix outside the default PATH (/opt/homebrew on
+# Apple Silicon) through `brew shellenv` in a shell startup file, which the
+# Homebrew installer leaves to the user.
+ensure_brew_on_login_path() {
+	local prefix profile files=()
+	prefix="$(brew --prefix)"
+	grep -qsFx "$prefix/bin" /etc/paths /etc/paths.d/* && return 0
+	case "$(basename "${SHELL:-}")" in
+	zsh)
+		profile="${ZDOTDIR:-$HOME}/.zprofile"
+		files=(/etc/zshenv /etc/zprofile /etc/zshrc "${ZDOTDIR:-$HOME}"/.{zshenv,zprofile,zshrc,zlogin})
+		;;
+	bash)
+		profile="$HOME/.bash_profile"
+		files=(/etc/profile /etc/bashrc "$HOME"/.{bash_profile,bashrc,profile})
+		;;
+	*)
+		warn "Add $prefix/bin to your PATH; ${SHELL:-your shell} is not set up automatically"
+		return 0
+		;;
+	esac
+	grep -qsF -e "brew shellenv" -e "$prefix/bin" "${files[@]}" && return 0
+	# shellcheck disable=SC2016 # the $(...) is written out for the shell to run later
+	printf '\neval "$(%s/bin/brew shellenv)"\n' "$prefix" >>"$profile"
+	info "Added Homebrew to PATH in $profile; open a new terminal to pick it up"
 }
 
 install_macos() {
@@ -138,18 +237,20 @@ install_macos() {
 	else
 		info "Homebrew already installed"
 	fi
+	ensure_brew_on_login_path
 
 	# --- Docker Compose (the Colima installer brings the docker CLI, not compose) ---
 	if ! brew list --formula docker-compose &>/dev/null; then
 		info "Installing docker-compose via brew..."
-		brew install docker-compose
+		brew_install_linked docker-compose
 	else
 		info "docker-compose already installed"
+		brew_link_formula docker-compose
 	fi
 
-	# --- Docker Compose CLI plugin (if not already wired) ---
+	# --- Docker Compose CLI plugin (if missing or a dangling link) ---
 	DOCKER_CLI_PLUGINS="$HOME/.docker/cli-plugins"
-	if [[ ! -L "$DOCKER_CLI_PLUGINS/docker-compose" ]]; then
+	if [[ ! -x "$DOCKER_CLI_PLUGINS/docker-compose" ]]; then
 		mkdir -p "$DOCKER_CLI_PLUGINS"
 		COMPOSE_BIN="$(brew --prefix docker-compose)/bin/docker-compose"
 		if [[ -f "$COMPOSE_BIN" ]]; then
@@ -164,6 +265,14 @@ install_macos() {
 		install_colima_builtin
 		return
 	fi
+	# That installer skips formulae that are already installed, so it would
+	# leave an unlinked docker or colima unlinked.
+	local formula
+	for formula in docker colima; do
+		if brew list --formula "$formula" &>/dev/null; then
+			brew_link_formula "$formula"
+		fi
+	done
 	if colima_profile_exists; then
 		info "Existing Colima profile found -- keeping the VM (--hooks-only)"
 		exec bash "$COLIMA_INSTALLER_PATH" --hooks-only "$@"
@@ -260,6 +369,7 @@ main() {
 
 	# --- Verify ---
 	info "Verifying Docker installation..."
+	command -v docker &>/dev/null || error "docker CLI is not on PATH; the install did not complete."
 	if docker info &>/dev/null; then
 		info "Docker is running!"
 		docker --version
