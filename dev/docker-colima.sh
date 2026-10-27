@@ -26,7 +26,7 @@ set -euo pipefail
 #
 # Options (macOS/Colima only):
 #   COLIMA_CPU=4          CPU cores for the VM       (default: 8, at most the host's)
-#   COLIMA_MEMORY=8       Memory cap in GB           (default: 8, at most half the host's RAM)
+#   COLIMA_MEMORY=8       Memory cap in GB           (default: 16 with 64GB+ RAM, else 12; at most half the host's RAM)
 #   COLIMA_DISK=60        Disk size in GB for the VM (default: 60)
 #   COLIMA_VMTYPE=vz      VM type: vz or qemu        (default: vz)
 #
@@ -39,12 +39,13 @@ set -euo pipefail
 # until the VM restarts. That is why a small Mac gets at most half its RAM. vz also
 # refuses more CPUs than the host has.
 default_colima_cpu=8
-default_colima_memory=8
+default_colima_memory=12
 if [ "$(uname -s)" = "Darwin" ]; then
 	host_cpu=$(sysctl -n hw.ncpu)
 	((default_colima_cpu > host_cpu)) && default_colima_cpu=$host_cpu
-	host_half_memory=$(($(sysctl -n hw.memsize) / 2147483648))
-	((default_colima_memory > host_half_memory)) && default_colima_memory=$host_half_memory
+	host_memory=$(($(sysctl -n hw.memsize) / 1073741824))
+	((host_memory >= 64)) && default_colima_memory=16
+	((default_colima_memory > host_memory / 2)) && default_colima_memory=$((host_memory / 2))
 fi
 COLIMA_CPU="${COLIMA_CPU:-$default_colima_cpu}"
 COLIMA_MEMORY="${COLIMA_MEMORY:-$default_colima_memory}"
