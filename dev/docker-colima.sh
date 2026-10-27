@@ -12,8 +12,9 @@ set -euo pipefail
 # Runner. That installer is found at $COLIMA_INSTALLER, else
 # ../llm-tools/install_colima_docker.sh next to this script, else
 # ~/Projects/llm-tools/install_colima_docker.sh. An existing Colima VM is kept
-# (it runs with --hooks-only); any arguments given here are passed to it, e.g.
-# --no-dmr or --dmr-backend vllm.
+# (it runs with --hooks-only), but restarted at COLIMA_CPU/COLIMA_MEMORY when its
+# size differs; any arguments given here are passed to it, e.g. --no-dmr or
+# --dmr-backend vllm.
 #
 # On macOS it also repairs what leaves brew packages off PATH: a formula brew
 # could not link (conflicting files from another keg, e.g. the deprecated
@@ -24,8 +25,8 @@ set -euo pipefail
 #   ./install_docker.sh [install_colima_docker.sh options]
 #
 # Options (macOS/Colima only):
-#   COLIMA_CPU=4          CPU cores for the VM       (default: half the host's, at most 8)
-#   COLIMA_MEMORY=8       Memory cap in GB           (default: a quarter of RAM, at most 16)
+#   COLIMA_CPU=4          CPU cores for the VM       (default: 8, at most the host's)
+#   COLIMA_MEMORY=8       Memory cap in GB           (default: 8, at most half the host's RAM)
 #   COLIMA_DISK=60        Disk size in GB for the VM (default: 60)
 #   COLIMA_VMTYPE=vz      VM type: vz or qemu        (default: vz)
 #
@@ -35,16 +36,15 @@ set -euo pipefail
 
 # Memory is a cap, not a reservation: a vz VM backs only the pages its guest touches but
 # never hands them back, so the host footprint grows to the full cap and stays there
-# until the VM restarts.
-default_colima_cpu=2
-default_colima_memory=4
+# until the VM restarts. That is why a small Mac gets at most half its RAM. vz also
+# refuses more CPUs than the host has.
+default_colima_cpu=8
+default_colima_memory=8
 if [ "$(uname -s)" = "Darwin" ]; then
-	default_colima_cpu=$(($(sysctl -n hw.ncpu) / 2))
-	((default_colima_cpu > 8)) && default_colima_cpu=8
-	((default_colima_cpu < 2)) && default_colima_cpu=2
-	default_colima_memory=$(($(sysctl -n hw.memsize) / 4294967296))
-	((default_colima_memory > 16)) && default_colima_memory=16
-	((default_colima_memory < 4)) && default_colima_memory=4
+	host_cpu=$(sysctl -n hw.ncpu)
+	((default_colima_cpu > host_cpu)) && default_colima_cpu=$host_cpu
+	host_half_memory=$(($(sysctl -n hw.memsize) / 2147483648))
+	((default_colima_memory > host_half_memory)) && default_colima_memory=$host_half_memory
 fi
 COLIMA_CPU="${COLIMA_CPU:-$default_colima_cpu}"
 COLIMA_MEMORY="${COLIMA_MEMORY:-$default_colima_memory}"
@@ -101,7 +101,8 @@ install_colima_builtin() {
 	info "Setting up Colima directly (llm-tools installer not found)"
 	brew_install_linked colima docker docker-compose
 	if colima_profile_exists; then
-		info "Existing Colima profile found -- leaving it running"
+		info "Existing Colima profile found -- keeping the VM"
+		resize_colima_vm
 		colima status 2>/dev/null || colima start
 	else
 		info "Starting Colima (${COLIMA_CPU} CPU, ${COLIMA_MEMORY}G RAM, ${COLIMA_DISK}G disk, ${COLIMA_VMTYPE})"
@@ -118,6 +119,66 @@ colima_profile_exists() {
 	command -v colima &>/dev/null || return 1
 	profiles="$(colima list -j 2>/dev/null)" || return 1
 	grep -q '"name":"default"' <<<"$profiles"
+}
+
+# Sets COLIMA_CUR_CPU and COLIMA_CUR_MEMORY (whole GB) from the default profile.
+colima_current_size() {
+	local line bytes
+	line="$(colima list -j | grep '"name":"default"')" ||
+		error "Could not find the default profile in 'colima list -j'"
+	COLIMA_CUR_CPU="$(plutil -extract cpus raw -o - - <<<"$line")" ||
+		error "Could not read the Colima VM's CPU count"
+	bytes="$(plutil -extract memory raw -o - - <<<"$line")" ||
+		error "Could not read the Colima VM's memory"
+	COLIMA_CUR_MEMORY=$((bytes / 1073741824))
+}
+
+# The llm-tools supervisor cold-restarts a VM whose docker socket stops answering, at
+# whatever size it was. Holding its lock keeps it out while the VM is down for a resize.
+# Same stale rule as the supervisor: nothing holds the lock for 15 minutes.
+SUPERVISOR_LOCK="$HOME/.colima/.health.lock"
+acquire_supervisor_lock() {
+	local age waited=0
+	until mkdir "$SUPERVISOR_LOCK" 2>/dev/null; do
+		age=$(($(date +%s) - $(stat -f %m "$SUPERVISOR_LOCK" 2>/dev/null || date +%s)))
+		if ((age > 900)); then
+			warn "Breaking a stale Colima supervisor lock (${age}s old)"
+			rmdir "$SUPERVISOR_LOCK" 2>/dev/null || true
+			continue
+		fi
+		((waited)) || info "Waiting for the Colima supervisor to finish its current run"
+		waited=1
+		sleep 5
+	done
+	trap 'rmdir "$SUPERVISOR_LOCK" 2>/dev/null || true' EXIT
+}
+
+release_supervisor_lock() {
+	rmdir "$SUPERVISOR_LOCK"
+	trap - EXIT
+}
+
+# An existing VM keeps the size it was created with until it is restarted with new
+# flags, so bring it to COLIMA_CPU and COLIMA_MEMORY. Disk is left alone: Colima can
+# only grow it, and an existing VM is often already bigger than the default.
+resize_colima_vm() {
+	[[ "$COLIMA_CPU" =~ ^[0-9]+$ && "$COLIMA_MEMORY" =~ ^[0-9]+$ ]] ||
+		error "COLIMA_CPU and COLIMA_MEMORY must be whole numbers (got ${COLIMA_CPU}, ${COLIMA_MEMORY})"
+	colima_current_size
+	if ((COLIMA_CUR_CPU == COLIMA_CPU && COLIMA_CUR_MEMORY == COLIMA_MEMORY)); then
+		info "Colima VM already has ${COLIMA_CPU} CPU, ${COLIMA_MEMORY}G RAM"
+		return 0
+	fi
+	info "Resizing the Colima VM from ${COLIMA_CUR_CPU} CPU, ${COLIMA_CUR_MEMORY}G RAM" \
+		"to ${COLIMA_CPU} CPU, ${COLIMA_MEMORY}G RAM"
+	warn "The VM restarts; containers without a restart policy stay stopped afterwards"
+	acquire_supervisor_lock
+	if colima status &>/dev/null; then
+		colima stop || error "Could not stop Colima to resize it"
+	fi
+	colima start --cpu "$COLIMA_CPU" --memory "$COLIMA_MEMORY" ||
+		error "Colima did not start with ${COLIMA_CPU} CPU, ${COLIMA_MEMORY}G RAM"
+	release_supervisor_lock
 }
 
 brew_is_linked() { [[ -L "$(brew --prefix)/var/homebrew/linked/$1" ]]; }
@@ -275,6 +336,9 @@ install_macos() {
 	done
 	if colima_profile_exists; then
 		info "Existing Colima profile found -- keeping the VM (--hooks-only)"
+		command -v colima &>/dev/null ||
+			error "A Colima profile exists but the colima CLI is not on PATH; run 'brew install colima' first"
+		resize_colima_vm
 		exec bash "$COLIMA_INSTALLER_PATH" --hooks-only "$@"
 	fi
 	info "Handing off to ${COLIMA_INSTALLER_PATH}"
