@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Detect the NVIDIA GPUs, then set each up as it needs: gpu-unlock for Ampere cards, the P2P-patched driver
-# for identical pairs, and a power cap applied at every boot. Steps already done are skipped.
+# for identical pairs, and a power and clock cap applied at every boot. Steps already done are skipped.
 # Usage: ./unlock_gpu.sh [--targets ...] [--src DIR] [--power-limit W|MODEL=W,...] [--p2p auto|yes|no]
 #        ./unlock_gpu.sh p2p-check|p2p-uninstall|p2p-host <vmid>   (see --help)
 set -euo pipefail
@@ -13,6 +13,8 @@ TARGETS_GIVEN=0
 SRC_DIR=""
 # 5090s stay at their stock 575W; the entry pins it so a lowered limit does not survive a reboot.
 POWER_LIMIT=3090=300,5090=575
+# 3090s drop off the bus from boost-clock power spikes that a power limit alone does not stop.
+CLOCK_CAP=3090=2000
 POWER_UNIT=/etc/systemd/system/nvidia-power-limit.service
 P2P=auto
 REBOOT_NEEDED=0
@@ -49,6 +51,7 @@ With no subcommand it sets up this machine for the NVIDIA GPUs it finds:
   P2P driver     Only when two identical cards are present and the stock open driver
                  is $P2P_VERSION on Debian/Ubuntu, inside the VM (not the Proxmox host).
   power cap      Every card, through a systemd unit that runs before Docker at each boot.
+                 The same unit locks GPU clocks per model ($CLOCK_CAP MHz max).
 
   --targets      Cards to unlock, as gpu_unlock.targets takes them (default: all, which
                  covers only the Ampere cards). PCI addresses as 'lspci -D' prints them.
@@ -596,16 +599,17 @@ host_main() {
 # ---------------------------------------------------------------- power cap
 
 POWER_CMDS=()
+CLOCK_CMDS=()
 
-# Prints the watts --power-limit gives a card with this name, or nothing when no entry matches.
-watts_for() {
-	local name="$1" entry
-	if [[ $POWER_LIMIT =~ ^[1-9][0-9]*$ ]]; then
-		echo "$POWER_LIMIT"
+# Prints the value a W or MODEL=W[,MODEL=W...] spec gives a card with this name, or nothing when no entry matches.
+model_value() {
+	local spec="$1" name="$2" entry
+	if [[ $spec =~ ^[1-9][0-9]*$ ]]; then
+		echo "$spec"
 		return
 	fi
 	local -a entries
-	IFS=, read -ra entries <<<"$POWER_LIMIT"
+	IFS=, read -ra entries <<<"$spec"
 	for entry in "${entries[@]}"; do
 		if [[ $name == *"${entry%=*}"* ]]; then
 			echo "${entry##*=}"
@@ -624,12 +628,14 @@ plan_power_limits() {
 	[[ $count -eq ${#GPU_ADDRS[@]} ]] ||
 		die "nvidia-smi reaches $count of the ${#GPU_ADDRS[@]} cards lspci lists; a card off the bus needs a reboot before power caps can be set"
 
-	local bus name min max watts
+	local bus name min max watts mhz
 	while IFS=, read -r bus name min max; do
 		name="${name# }"
 		min="${min# }"
 		max="${max# }"
-		watts="$(watts_for "$name")"
+		mhz="$(model_value "$CLOCK_CAP" "$name")"
+		[[ -z $mhz ]] || CLOCK_CMDS+=("$bus $mhz")
+		watts="$(model_value "$POWER_LIMIT" "$name")"
 		if [[ -z $watts ]]; then
 			log "$bus $name: no --power-limit entry matches, keeping its default limit"
 			continue
@@ -655,6 +661,9 @@ EOF
 	for entry in "${POWER_CMDS[@]}"; do
 		echo "ExecStart=/usr/bin/nvidia-smi -i ${entry% *} -pl ${entry#* }"
 	done
+	for entry in "${CLOCK_CMDS[@]}"; do
+		echo "ExecStart=/usr/bin/nvidia-smi -i ${entry% *} -lgc 210,${entry#* }"
+	done
 	cat <<EOF
 RemainAfterExit=yes
 
@@ -667,8 +676,8 @@ EOF
 # containers with a restart policy never start on uncapped cards.
 ensure_power_limit() {
 	plan_power_limits
-	if [[ ${#POWER_CMDS[@]} -eq 0 ]]; then
-		log "no card gets a power cap"
+	if [[ ${#POWER_CMDS[@]} -eq 0 && ${#CLOCK_CMDS[@]} -eq 0 ]]; then
+		log "no card gets a power or clock cap"
 		return
 	fi
 	if [[ -f $POWER_UNIT ]] && diff -q <(power_unit_text) "$POWER_UNIT" >/dev/null; then
@@ -681,8 +690,8 @@ ensure_power_limit() {
 	systemctl is-enabled --quiet nvidia-power-limit.service || sudo systemctl enable nvidia-power-limit.service
 	sudo systemctl restart nvidia-power-limit.service ||
 		die "could not apply the power caps now (see: journalctl -u nvidia-power-limit); the unit is enabled and runs at next boot"
-	log "power limits now:"
-	nvidia-smi --query-gpu=index,name,power.limit --format=csv,noheader | sed 's/^/  GPU /'
+	log "power limits and current SM clocks now:"
+	nvidia-smi --query-gpu=index,name,power.limit,clocks.sm --format=csv,noheader | sed 's/^/  GPU /'
 }
 
 # ---------------------------------------------------------------- main
