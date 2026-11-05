@@ -369,8 +369,15 @@ any slot, boots, and registers; GitHub hands it the job. If the job goes
 elsewhere or is cancelled while the slot waits for memory, the slot goes back
 to idle. A booted VM that sits `DEMAND_IDLE_SEC` (180) without a job and with
 no other queued job for it is deregistered and stopped, and for the next hour
-the job it booted for does not start it again. That covers a job from a repo
+the job it booted for does not start it again. If it boots a VM for nothing
+again, the wait doubles each time, up to a day. That covers a job from a repo
 the runner group excludes, which would otherwise boot the VM over and over.
+Restarting the slot's service clears the waits.
+
+Jobs of public repos never start a slot: a runner group serves a public repo
+only when it is set to, and a job it never delivers would boot the VM for
+nothing. Jobs of private and internal repos are unaffected. An always-on slot
+is not filtered this way, since GitHub decides what it is offered.
 
 The watched repos are every unarchived repo the credentials reach, or
 `DEMAND_REPOS` (comma-separated names) when set; in repo scope, the repo. Each

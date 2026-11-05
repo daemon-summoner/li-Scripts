@@ -1449,6 +1449,7 @@ mint_jit() {
 DEMAND_REPOS_TTL=600
 DEMAND_RECHECK_SEC=300
 DEMAND_IGNORE_SEC=3600
+DEMAND_IGNORE_MAX_SEC=86400
 # GitHub requests one queue scan keeps in flight.
 DEMAND_FETCH_PAR=8
 _DEMAND_BUCKET=0
@@ -1470,9 +1471,9 @@ _DEMAND_RR=0
 # The job the running VM was booted for, and its app.
 _DEMAND_BOOTED=""
 _DEMAND_BOOTED_APP=main
-# "<job id>:<until epoch>" for jobs a VM was booted for and never got (a
-# runner group that excludes the repo, a job taken elsewhere), so they do not
-# boot the VM over and over.
+# "<job id>:<until epoch>:<times>" for jobs a VM was booted for and never got
+# (a runner group that excludes the repo, a job taken elsewhere), so they do
+# not boot the VM over and over.
 _DEMAND_IGNORE=""
 _DEMAND_SAID=""
 
@@ -1597,14 +1598,17 @@ demand_queued_jobs() {
 }
 
 # "<owner/repo> <run id> <updated_at>" for each queued or in-progress run of
-# repo $1.
+# repo $1, none when $1 is public: a runner group serves a public repo only
+# when it is set to, and a job it never delivers would boot the VM for nothing.
+# A run that does not say is kept.
 demand_repo_runs() {
 	local st runs n
 	for st in queued in_progress; do
 		runs="$(api_get_cached "/repos/$1/actions/runs?status=$st&per_page=100")" || return 1
 		n="$(jq '.workflow_runs | length' <<<"$runs")" || return 1
 		((n < 100)) || log "demand: WARN $1 has 100+ $st runs; only the newest 100 are checked"
-		jq -r --arg r "$1" '.workflow_runs[] | "\($r) \(.id) \(.updated_at)"' <<<"$runs" || return 1
+		jq -r --arg r "$1" '.workflow_runs[] | select(.repository.private != false)
+			| "\($r) \(.id) \(.updated_at)"' <<<"$runs" || return 1
 	done
 }
 
@@ -1897,25 +1901,42 @@ demand_take() {
 }
 
 demand_ignored() {
-	local e now entries=()
+	local e now jid end entries=()
 	now=$(date +%s)
 	read -ra entries <<<"$_DEMAND_IGNORE"
 	for e in "${entries[@]}"; do
-		[[ "${e%:*}" == "$1" ]] && ((${e#*:} > now)) && return 0
+		IFS=: read -r jid end _ <<<"$e"
+		[[ "$jid" == "$1" ]] && ((end > now)) && return 0
 	done
 	return 1
 }
 
-# Keeps job $1 from starting the slot for DEMAND_IGNORE_SEC.
+# Keeps job $1 from starting the slot again: for DEMAND_IGNORE_SEC the first
+# time a VM booted for it got no job, twice as long each time after that, up to
+# DEMAND_IGNORE_MAX_SEC. A job no runner here can take then costs a few boots
+# a day, not one an hour. A job already being ignored keeps its entry: a failed
+# deregistration makes the run loop call this again for the same VM.
 demand_ignore() {
-	local e now keep="" entries=()
+	local e now jid end cnt i n=0 delay keep="" entries=()
 	[[ -n "$1" ]] || return 0
 	now=$(date +%s)
 	read -ra entries <<<"$_DEMAND_IGNORE"
 	for e in "${entries[@]}"; do
-		((${e#*:} > now)) && keep+="$e "
+		IFS=: read -r jid end cnt <<<"$e"
+		if [[ "$jid" == "$1" ]]; then
+			((end > now)) && return 0
+			n=$cnt
+		elif ((end + DEMAND_IGNORE_MAX_SEC > now)); then
+			keep+="$e "
+		fi
 	done
-	_DEMAND_IGNORE="$keep$1:$((now + DEMAND_IGNORE_SEC))"
+	n=$((n + 1))
+	delay=$DEMAND_IGNORE_SEC
+	for ((i = 1; i < n && delay < DEMAND_IGNORE_MAX_SEC; i++)); do
+		delay=$((delay * 2))
+	done
+	((delay <= DEMAND_IGNORE_MAX_SEC)) || delay=$DEMAND_IGNORE_MAX_SEC
+	_DEMAND_IGNORE="$keep$1:$((now + delay)):$n"
 }
 
 # The run loop's gate for on-demand slot $1: 0 once a queued job wants it;
