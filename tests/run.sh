@@ -53,6 +53,10 @@ else
 	skip "shellcheck not installed -- lint PARTIAL (bash -n only)"
 fi
 
+# Behaviour checks that need no Docker or Windows.
+bash "$HERE/wslconfig.sh"
+bash "$HERE/wsl-compact.sh"
+
 # gha-runner is a self-contained subproject with its own VM/Docker suite; run it
 # separately when working on it:  bash dev/gha-runner/tests/run.sh
 

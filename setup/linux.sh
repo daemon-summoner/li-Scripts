@@ -16,6 +16,10 @@
 #   7  --hyperv-guest   Hyper-V guest additions
 #   8  --wsl-fix        WSL systemd/interop fixes (restarts WSL)
 #
+# On WSL every run also sets autoMemoryReclaim=gradual in the Windows-side .wslconfig, unless the file
+# already sets that key, so the VM gives idle memory back to Windows. It takes effect after
+# `wsl --shutdown`. Hold it back with --skip wsl-config.
+#
 # Options:
 #   --user NAME         login to create/configure for core (else prompted)
 #   --only IDS          run only these module ids (comma-separated)
@@ -36,7 +40,7 @@ source "$LI_ROOT/lib/platform.sh"
 # shellcheck source=setup/common.sh
 source "$HERE/common.sh"
 for m in base shell cli-tools python node go docker kubernetes git-config \
-	hardening server desktop guests nvidia editors; do
+	hardening server desktop guests nvidia editors wsl; do
 	# shellcheck source=/dev/null
 	source "$HERE/modules/$m.sh"
 done
@@ -197,6 +201,9 @@ require_root "Linux setup (try: sudo $0 $*)"
 li_load_config
 li_seed_config
 li_load_config
+
+# --- WSL: let the VM hand idle memory back to Windows (idempotent) -------------
+is_wsl && run_mod wsl-config "WSL memory reclaim" mod_wsl_config
 
 # --- WSL fixes (special: restarts WSL and does not return) --------------------
 if [[ "$want_wsl" == y ]] && is_wsl; then

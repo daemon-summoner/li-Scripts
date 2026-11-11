@@ -69,6 +69,7 @@ Run any of these as `./li <command>`. Platform notes in parentheses; everything 
 | `benchmark` | Quick system benchmark *(Linux)* |
 | `swap-resize` | Resize the swap file *(Linux)* |
 | `zero-free-space` | Zero free space to shrink disk images |
+| `wsl-compact` | Give disk space freed inside WSL back to Windows — stops WSL, then compacts the distro's disk *(WSL)* |
 | `grub-repair` | Repair / reinstall GRUB *(Linux)* |
 | `gpu-unlock` | Unlock NVIDIA 30/50-series limits *(Linux)* |
 | `usb-windows11` | Make a bootable Windows 11 USB *(macOS)* |
@@ -122,7 +123,7 @@ li-Scripts/
 ├── config/
 │   ├── config.env.example   # committed sample
 │   └── config.env           # your live values (gitignored, self-seeded)
-├── system/             # update, cleanup-disk, benchmark, swap, grub, gpu, usb
+├── system/             # update, cleanup-disk, benchmark, swap, wsl-compact, grub, gpu, usb
 ├── network/            # scp, rsync, ssh-keygen, ufw-allow, wsl-to-desktop
 ├── dev/                # docker, kasm, claude-resume, gha-runner/
 ├── security/           # Wi-Fi research demos + DuckyScript payloads
@@ -141,6 +142,7 @@ li-Scripts/
 - **Pick what you want.** Choose from a numbered menu, or pass named flags (`--core`, `--security`, `--server`, `--basic`, `--vram`, …). Run just one piece with `--only <module>`, or hold one back with `--skip <module>`.
 - **Defaults match the old behavior** — with one deliberate change: it no longer reboots you automatically. It asks, or you pass `--reboot` / `--no-reboot`.
 - **Modular.** Shell, CLI tools, Python, Node, Go, Docker, editors, git config, and (on Linux) hardening, server, desktop, NVIDIA, and Kubernetes are each their own toggleable module.
+- **WSL-aware.** On a WSL Ubuntu VM, setup also adds `autoMemoryReclaim=gradual` to your Windows `.wslconfig` (if it isn't already set), so the VM gives idle memory back to Windows instead of holding its file cache forever. Run `wsl --shutdown` once for it to take effect, or hold it back with `--skip wsl-config`.
 
 ```bash
 sudo ./setup.sh --core --security     # Linux: base system + hardening
