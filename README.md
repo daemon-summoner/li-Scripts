@@ -180,7 +180,7 @@ Every script follows the same house style — `set -Eeuo pipefail`, self-documen
 bash tests/run.sh    # bash -n on everything, shellcheck -x on the active tree
 ```
 
-`gha-runner/` is a self-contained subproject with its own test suite; run it separately when you work on it.
+`dev/gha-runner/` is a self-contained subproject with its own test suite; run it separately when you work on it.
 
 ---
 

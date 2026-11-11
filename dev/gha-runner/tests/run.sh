@@ -473,6 +473,22 @@ SH
 	dout="$(dm_run)" || fail "demand exited non-zero with DEMAND_REPOS: $dout"
 	[[ "$dout" == "slot 1: idle; no queued job asks for large" ]] || fail "DEMAND_REPOS=b should watch only b: $dout"
 	grep -qE '/orgs/|/repos/example-org/a/' "$dm/log" && fail "DEMAND_REPOS=b still listed other repos: $(<"$dm/log")"
+	# A public repo's queued job never lands on a runner group that excludes
+	# it, so it must not start the slot, nor cost a jobs request.
+	gh_api '/repos/example-org/pub/actions/runs?status=in_progress&per_page=100' '{"workflow_runs":[]}'
+	gh_api '/repos/example-org/pub/actions/runs/9/jobs?filter=latest&per_page=100' \
+		'{"jobs":[{"id":90,"status":"queued","labels":["self-hosted","large"]}]}'
+	gh_api '/repos/example-org/pub/actions/runs?status=queued&per_page=100' \
+		'{"workflow_runs":[{"id":9,"updated_at":"2026-01-01T00:00:00Z","repository":{"private":false}}]}'
+	fleet_env <<<"$dcfg"$'\nDEMAND_REPOS=pub'
+	: >"$dm/log"
+	dout="$(dm_run)" || fail "demand exited non-zero with a public repo: $dout"
+	[[ "$dout" == "slot 1: idle; no queued job asks for large" ]] || fail "a queued job in a public repo must not start the slot: $dout"
+	grep -q '/runs/9/jobs' "$dm/log" && fail "demand fetched the jobs of a public repo's run: $(<"$dm/log")"
+	gh_api '/repos/example-org/pub/actions/runs?status=queued&per_page=100' \
+		'{"workflow_runs":[{"id":9,"updated_at":"2026-01-01T00:00:00Z","repository":{"private":true}}]}'
+	dout="$(dm_run)" || fail "demand exited non-zero with a private repo: $dout"
+	[[ "$dout" == "slot 1: wanted by job 90 in example-org/pub" ]] || fail "the same job in a private repo should start the slot: $dout"
 
 	: >"$dm/run/.slot-1.lock"
 	flock "$dm/run/.slot-1.lock" sleep 60 &
@@ -616,6 +632,51 @@ SH
 	if dout="$(ma_run demand)"; then fail "an app file named main.env was accepted"; fi
 	rm -f "$ma/main.env"
 	pass "several apps: each org read with its own credential, plain slots shared, claims honoured, bad app files refused"
+
+	# A job a VM boots for but never gets (its repo is outside the runner group)
+	# backs off longer each time. The two functions are lifted from the installed
+	# script as they are, since sourcing it would run main; only date is stubbed.
+	(
+		eval "$(sed -n '/^demand_ignored() {$/,/^}$/p;/^demand_ignore() {$/,/^}$/p' "$gha")"
+		export DEMAND_IGNORE_SEC=3600 DEMAND_IGNORE_MAX_SEC=86400
+		_DEMAND_IGNORE="" NOW=1000000
+		# shellcheck disable=SC2329 # the lifted functions call it
+		date() { printf '%s\n' "$NOW"; }
+		t0=$NOW
+		demand_ignored 7 && fail "a job nobody ignored reads as ignored"
+		demand_ignore 7
+		NOW=$((t0 + 3599))
+		demand_ignored 7 || fail "the first ignore should hold for DEMAND_IGNORE_SEC"
+		NOW=$((t0 + 3601))
+		demand_ignored 7 && fail "the first ignore should lapse after DEMAND_IGNORE_SEC"
+		demand_ignore 7
+		NOW=$((t0 + 3601 + 7199))
+		demand_ignored 7 || fail "the second ignore should last twice as long"
+		demand_ignore 7
+		NOW=$((t0 + 3601 + 7201))
+		demand_ignored 7 && fail "a call while the job is still ignored must not escalate it"
+		L=$NOW
+		for i in 1 2 3 4 5 6 7 8; do
+			NOW=$L
+			demand_ignore 7
+			L=$((L + 86401))
+		done
+		L=$((L - 86401))
+		NOW=$L
+		demand_ignore 8
+		NOW=$((L + 3599))
+		demand_ignored 8 || fail "another job should be ignored for its own DEMAND_IGNORE_SEC"
+		NOW=$((L + 86399))
+		demand_ignored 8 && fail "another job's first ignore should not inherit job 7's escalation"
+		demand_ignored 7 || fail "a job ignored many times should wait DEMAND_IGNORE_MAX_SEC"
+		NOW=$((L + 86401))
+		demand_ignored 7 && fail "no ignore should outlast DEMAND_IGNORE_MAX_SEC"
+		NOW=$((L + 10 * 86400))
+		demand_ignore 9
+		read -ra ents <<<"$_DEMAND_IGNORE"
+		((${#ents[@]} == 1)) || fail "entries for jobs gone for over a day should be dropped: $_DEMAND_IGNORE"
+	) || exit 1
+	pass "a job a VM was booted for and never got backs off longer each time, up to a day"
 
 	# bundle: the checkout plus the pool's config without this host's keys,
 	# every app file, every key at the path the receiving host installs it to.
