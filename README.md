@@ -142,7 +142,7 @@ li-Scripts/
 - **Pick what you want.** Choose from a numbered menu, or pass named flags (`--core`, `--security`, `--server`, `--basic`, `--vram`, …). Run just one piece with `--only <module>`, or hold one back with `--skip <module>`.
 - **Defaults match the old behavior** — with one deliberate change: it no longer reboots you automatically. It asks, or you pass `--reboot` / `--no-reboot`.
 - **Modular.** Shell, CLI tools, Python, Node, Go, Docker, editors, git config, and (on Linux) hardening, server, desktop, NVIDIA, and Kubernetes are each their own toggleable module.
-- **WSL-aware.** On a WSL Ubuntu VM, setup also adds `autoMemoryReclaim=gradual` to your Windows `.wslconfig` (if it isn't already set), so the VM gives idle memory back to Windows instead of holding its file cache forever. Run `wsl --shutdown` once for it to take effect, or hold it back with `--skip wsl-config`.
+- **WSL-aware.** On a WSL Ubuntu VM, setup also adds `autoMemoryReclaim=gradual` to your Windows `.wslconfig` (if it isn't already set), so the VM gives idle memory back to Windows instead of holding its file cache forever. Run `wsl --shutdown` once for it to take effect, or hold it back with `--skip wsl-config`. It also caps the VM with `memory=` set to half the PC's RAM, at most 32GB (a 16 GB PC gets 8GB, a 64 GB or bigger PC gets 32GB), again only if `.wslconfig` doesn't already set `memory`. Hold that back with `--skip wsl-memory`.
 
 ```bash
 sudo ./setup.sh --core --security     # Linux: base system + hardening

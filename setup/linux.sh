@@ -19,6 +19,8 @@
 # On WSL every run also sets autoMemoryReclaim=gradual in the Windows-side .wslconfig, unless the file
 # already sets that key, so the VM gives idle memory back to Windows. It takes effect after
 # `wsl --shutdown`. Hold it back with --skip wsl-config.
+# It also sets memory= in the same file to half the PC's RAM, at most 32GB, unless the file already sets
+# memory. Hold that back with --skip wsl-memory.
 #
 # Options:
 #   --user NAME         login to create/configure for core (else prompted)
@@ -204,6 +206,9 @@ li_load_config
 
 # --- WSL: let the VM hand idle memory back to Windows (idempotent) -------------
 is_wsl && run_mod wsl-config "WSL memory reclaim" mod_wsl_config
+
+# --- WSL: cap the VM at half the PC's RAM, at most 32GB (idempotent) -----------
+is_wsl && run_mod wsl-memory "WSL memory size" mod_wsl_memory
 
 # --- WSL fixes (special: restarts WSL and does not return) --------------------
 if [[ "$want_wsl" == y ]] && is_wsl; then
